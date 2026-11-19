@@ -23,6 +23,7 @@ from staticfire.openaev import (
     OpenAEVError,
     wait_until,
 )
+from staticfire.opencti import OpenCTI, OpenCTIError
 
 MARKER_PAYLOAD_NAME = "staticfire - echo marker"
 TECHNICAL_EXPECTATIONS = ("DETECTION", "PREVENTION")
@@ -44,6 +45,12 @@ def parse_date(value: str) -> datetime:
         value = f"{head}.{digits[:6]}{tail[len(digits) :]}"
     parsed = datetime.fromisoformat(value)
     return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+
+
+def cti_client(profile: Profile) -> OpenCTI:
+    if not profile.opencti_url:
+        raise ValueError(f"Profile {profile.name} has no OpenCTI (opencti_url)")
+    return OpenCTI(profile.opencti_url, profile.opencti_token)
 
 
 def client(profile: Profile) -> OpenAEV:
@@ -187,7 +194,7 @@ def component_up(
     elif (existing := runner.get_run(run_name)) and existing.alive:
         return {"component": component.__dict__, "run": existing.summary(), "reused": True}
     run = runner.start(component, profile, env, run_name=run_name, log_level=log_level)
-    api = client(profile)
+    api = cti_client(profile) if component.kind == "connector" else client(profile)
     registered, entity = wait_until(
         lambda: _registered(api, component) if run.alive else "died", timeout, 2
     )
@@ -207,7 +214,21 @@ def component_up(
     return result
 
 
-def _registered(api: OpenAEV, component: runner.Component) -> dict | None:
+def _registered(api: OpenAEV | OpenCTI, component: runner.Component) -> dict | None:
+    if component.kind == "connector":
+        try:
+            connector = api.connector(component.component_id)
+        except OpenCTIError:
+            return None
+        return (
+            connector
+            and connector.get("active")
+            and {
+                "id": connector["id"],
+                "name": connector.get("name"),
+                "type": connector.get("connector_type"),
+            }
+        )
     try:
         if component.kind == "injector":
             injector = api.injector(component.component_id)

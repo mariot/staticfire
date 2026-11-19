@@ -14,11 +14,14 @@ import re
 import time
 import uuid
 from collections.abc import Callable
+from datetime import UTC, datetime
 from pathlib import Path
 
 from staticfire import (
     ai_vendors,
     catalog_vendors,
+    config,
+    connector_vendors,
     fakes,
     injector_vendors,
     logscan,
@@ -43,7 +46,8 @@ def checkout(repo: str, name: str, path: str | None = None) -> str:
         candidates.append(Path(env) / name)
     candidates += [STATICFIRE_ROOT.parent / repo / name, Path.home() / "GitHub" / repo / name]
     for candidate in candidates:
-        if (candidate / "pyproject.toml").exists():
+        # Collectors and injectors have a pyproject.toml, most OpenCTI connectors a src/ folder
+        if (candidate / "pyproject.toml").exists() or (candidate / "src").is_dir():
             return str(candidate)
     raise FileNotFoundError(
         f"No {repo}/{name} checkout found (tried {[str(c) for c in candidates]}); pass its path"
@@ -726,6 +730,110 @@ def ai_collector(
     return report
 
 
+def _cti_profile(profile: Profile) -> Profile:
+    """The profile itself if it holds OpenCTI, otherwise the first saved one that does."""
+    if profile.opencti_url:
+        return profile
+    for name in config.list_profiles():
+        candidate = config.load_profile(name)
+        if candidate.opencti_url:
+            return candidate
+    raise ValueError("No profile with an OpenCTI platform: staticfire profile from-multipass <vm>")
+
+
+def _connector_works(cti, connector_id: str, since: float) -> list[dict]:
+    connector = cti.connector(connector_id) or {}
+    works = [
+        w
+        for w in connector.get("works") or []
+        if ops.parse_date(w["timestamp"]).timestamp() >= since - 5
+    ]
+    return works
+
+
+def connector_test(
+    profile: Profile,
+    spec_name: str,
+    connector_path: str | None = None,
+    keep: bool = False,
+    timeout: float | None = None,
+) -> Report:
+    """OpenCTI connector test: run it against ofapi, judge its works and what they touched."""
+    spec = connector_vendors.SPECS[spec_name]
+    report = Report(spec.recipe)
+    family, name = spec.connector.split("/", 1)
+    connector_dir = Path(connector_path or checkout("connectors", spec.connector))
+    run_name = f"connector-{connector_dir.name}"
+    fake = None
+    try:
+        profile = _cti_profile(profile)
+        cti = ops.cti_client(profile)
+        report.refs["opencti"] = profile.opencti_url
+        fake = fakes.ofapi_up()
+        fake.reset()
+        for rule in spec.rules(fake):
+            fake.rule(rule.path, [rule.response()], method=rule.method)
+        env = {
+            "CONNECTOR_NAME": f"staticfire {spec.recipe}",
+            "CONNECTOR_DURATION_PERIOD": "PT1H",
+            **spec.env(fake),
+        }
+        env = {**connector_vendors.schema_placeholders(connector_dir, env), **env}
+        started = time.time()
+        up = _start(report, profile, str(connector_dir), "connector", kind="connector", env=env)
+        if not up:
+            return report
+        connector_id = up["component"]["id"]
+        if spec.enrich:
+            kind, value = spec.enrich
+            observable = cti.create_observable(kind, value)
+            report.refs["observable"] = observable["id"]
+            cti.ask_enrichment(observable["id"], connector_id)
+
+        def done() -> list[dict] | None:
+            works = _connector_works(cti, connector_id, started)
+            finished = [w for w in works if w["status"] == "complete"]
+            return finished or None
+
+        finished, works = wait_until(done, timeout or spec.timeout, 10)
+        works = works or _connector_works(cti, connector_id, started)
+        report.evidence["works"] = works
+        if not report.check("a connector run (work) completes", finished, works):
+            return report
+        errors = [e for w in works for e in w.get("errors") or []]
+        report.check("its works report no error", not errors, errors[:5])
+        processed = sum(w.get("completed_number") or 0 for w in works)
+        report.check(
+            f"its works processed at least {spec.min_elements} element(s)",
+            processed >= spec.min_elements,
+            processed,
+        )
+        since = datetime.fromtimestamp(started - 5, UTC).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+        changed = cti.changed_since(since)
+        types = sorted({c.get("relationship_type") or c.get("entity_type") for c in changed})
+        report.evidence["ingested_types"] = types
+        if spec.expected_types:
+            report.check(
+                f"ingested types include {sorted(spec.expected_types)}",
+                spec.expected_types <= set(types),
+                types,
+            )
+        for path in spec.calls:
+            calls = fake.journal(path)
+            report.evidence.setdefault("vendor_calls", {})[path] = calls[:2]
+            report.check(f"connector called {path}", calls, "no call recorded")
+    except Exception as err:
+        report.error = f"{type(err).__name__}: {err}"
+    finally:
+        if report.verdict != "PASS":
+            report.evidence["connector_log"] = _safe_tail(run_name)
+        if not keep:
+            runner.stop(run_name)
+            if fake and fake.started:
+                runner.stop(fakes.OFAPI_RUN)
+    return report
+
+
 def _safe_tail(run_name: str) -> str | None:
     try:
         return runner.tail(run_name, 40)
@@ -742,6 +850,7 @@ RECIPES: dict[str, Callable[..., Report]] = {
         name: functools.partial(catalog_collector, spec_name=name) for name in catalog_vendors.SPECS
     },
     **{name: functools.partial(ai_collector, spec_name=name) for name in ai_vendors.SPECS},
+    **{name: functools.partial(connector_test, spec_name=name) for name in connector_vendors.SPECS},
 }
 
 DESCRIPTIONS = {
@@ -771,6 +880,10 @@ DESCRIPTIONS = {
         f"({spec.description}). Option verdict: {', '.join(spec.verdicts)}."
         for name, spec in ai_vendors.SPECS.items()
     },
+    **{
+        name: f"OpenCTI connector test: {spec.connector} against ofapi ({spec.description})."
+        for name, spec in connector_vendors.SPECS.items()
+    },
 }
 
 
@@ -786,15 +899,21 @@ def verdicts_of(name: str) -> list[str | None]:
 def run_recipe(profile: Profile, name: str, **options) -> Report:
     """Run a recipe, then review the warnings and errors logged meanwhile (components, platform)."""
     started_at = time.time()
+    platform = "opencti" if name in connector_vendors.SPECS else "openaev"
+    log_profile = profile
     try:
-        skew = ops.client(profile).clock_skew()
+        if platform == "opencti":
+            log_profile = _cti_profile(profile)
+            skew = logscan.host_skew(log_profile)
+        else:
+            skew = ops.client(profile).clock_skew()
     except Exception:
         skew = 0.0
     fn = RECIPES[name]
     accepted = inspect.signature(fn).parameters
     report = fn(profile, **{k: v for k, v in options.items() if k in accepted and v})
     try:
-        logs = logscan.review(profile, started_at, skew)
+        logs = logscan.review(log_profile, started_at, skew, platform)
         report.evidence["logs"] = logs
         report.refs["logs"] = logscan.one_line(logs)
     except Exception as err:  # the review must never hide the recipe's own verdict

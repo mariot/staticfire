@@ -24,6 +24,8 @@ CURRENT_FILE = CONFIG_DIR / "current"
 ENV_OVERRIDES = {
     "openaev_url": "STATICFIRE_OPENAEV_URL",
     "openaev_token": "STATICFIRE_OPENAEV_TOKEN",
+    "opencti_url": "STATICFIRE_OPENCTI_URL",
+    "opencti_token": "STATICFIRE_OPENCTI_TOKEN",
     "mailpit_url": "STATICFIRE_MAILPIT_URL",
     "smtp_host": "STATICFIRE_SMTP_HOST",
     "smtp_port": "STATICFIRE_SMTP_PORT",
@@ -37,8 +39,11 @@ class ConfigError(RuntimeError):
 @dataclass
 class Profile:
     name: str
-    openaev_url: str
-    openaev_token: str
+    openaev_url: str = ""
+    openaev_token: str = ""
+    # OpenCTI, for connector tests (a profile may hold either platform or both)
+    opencti_url: str = ""
+    opencti_token: str = ""
     # Mail catcher (mailpit) HTTP API, used to check what email injectors sent
     mailpit_url: str | None = None
     # SMTP server as reachable from where injectors run (the laptop), for email injects
@@ -51,10 +56,18 @@ class Profile:
     extra: dict = field(default_factory=dict)
 
     def public(self) -> dict:
-        """The profile without its secret, safe to print or hand to a model."""
+        """The profile without its secrets, safe to print or hand to a model."""
         data = asdict(self)
-        data["openaev_token"] = "***" if self.openaev_token else ""
+        for secret in ("openaev_token", "opencti_token"):
+            data[secret] = "***" if data[secret] else ""
         return data
+
+    @property
+    def host(self) -> str | None:
+        """The platform host (its IP for a liftoff VM): where its RabbitMQ is reachable too."""
+        from urllib.parse import urlparse
+
+        return urlparse(self.opencti_url or self.openaev_url).hostname
 
     def remote_command(self, command: str) -> list[str]:
         """argv running ``command`` on the platform host, through multipass or ssh."""
@@ -101,18 +114,24 @@ def load_profile(name: str | None = None) -> Profile:
         path = _profile_path(name)
         if path.exists():
             data = json.loads(path.read_text())
-        elif not os.environ.get(ENV_OVERRIDES["openaev_url"]):
+        elif not (
+            os.environ.get(ENV_OVERRIDES["openaev_url"])
+            or os.environ.get(ENV_OVERRIDES["opencti_url"])
+        ):
             raise ConfigError(f"Unknown profile {name!r}, known: {list_profiles()}")
     data.setdefault("name", name or "env")
     for key, env in ENV_OVERRIDES.items():
         if value := os.environ.get(env):
             data[key] = int(value) if key == "smtp_port" else value
-    if not data.get("openaev_url") or not data.get("openaev_token"):
+    has_openaev = data.get("openaev_url") and data.get("openaev_token")
+    has_opencti = data.get("opencti_url") and data.get("opencti_token")
+    if not (has_openaev or has_opencti):
         raise ConfigError(
-            "No OpenAEV target: create a profile (staticfire profile from-multipass <vm>) "
-            "or set STATICFIRE_OPENAEV_URL and STATICFIRE_OPENAEV_TOKEN"
+            "No platform: create a profile (staticfire profile from-multipass <vm>) or set "
+            "STATICFIRE_OPENAEV_URL/_TOKEN or STATICFIRE_OPENCTI_URL/_TOKEN"
         )
-    data["openaev_url"] = data["openaev_url"].rstrip("/")
+    for key in ("openaev_url", "opencti_url"):
+        data[key] = (data.get(key) or "").rstrip("/")
     return Profile(**data)
 
 
@@ -151,15 +170,32 @@ def profile_from_liftoff(
     if result.returncode != 0:
         raise ConfigError(f"Cannot read {deploy_dir}/.env on the host: {result.stderr.strip()}")
     env = parse_env_file(result.stdout)
-    host = env.get("OPENAEV_HOST")
+    host = env.get("OPENAEV_HOST") or env.get("OPENCTI_HOST")
     if not host:
-        raise ConfigError(f"OPENAEV_HOST missing from {deploy_dir}/.env")
-    scheme = env.get("OPENAEV_EXTERNAL_SCHEME", "http")
-    port = env.get("OPENAEV_PORT", "8081")
-    stub.openaev_url = f"{scheme}://{host}:{port}"
-    stub.openaev_token = env["OPENAEV_ADMIN_TOKEN"]
-    # liftoff publishes mailpit (service "mailtrap") on 1025/8025 and points OpenAEV at it
+        raise ConfigError(f"Neither OPENAEV_HOST nor OPENCTI_HOST in {deploy_dir}/.env")
+    # liftoff deploys OpenAEV, OpenCTI or both: keep whichever this host runs
+    if _running(stub, "openaev"):
+        scheme = env.get("OPENAEV_EXTERNAL_SCHEME", "http")
+        stub.openaev_url = f"{scheme}://{host}:{env.get('OPENAEV_PORT', '8081')}"
+        stub.openaev_token = env["OPENAEV_ADMIN_TOKEN"]
+    if _running(stub, "opencti"):
+        scheme = env.get("OPENCTI_EXTERNAL_SCHEME", "http")
+        stub.opencti_url = f"{scheme}://{host}:{env.get('OPENCTI_PORT', '8080')}"
+        stub.opencti_token = env["OPENCTI_ADMIN_TOKEN"]
+    # liftoff publishes mailpit (service "mailtrap") on 1025/8025 and points the platforms at it
     stub.mailpit_url = f"http://{host}:8025"
     stub.smtp_host = host
     stub.smtp_port = 1025
     return stub
+
+
+def _running(profile: Profile, service: str) -> bool:
+    """Whether the host runs that platform's container (liftoff names it xtm-<service>-1)."""
+    result = subprocess.run(
+        profile.remote_command(
+            f"sudo docker ps --format '{{{{.Names}}}}' | grep -qx 'xtm-{service}-1'"
+        ),
+        capture_output=True,
+        check=False,
+    )
+    return result.returncode == 0

@@ -26,7 +26,15 @@ from staticfire.config import STATE_DIR, Profile
 ID_NAMESPACE = uuid.UUID("5f7a1c2e-9b3d-4e8f-a6c1-2d4b6e8f0a1c")
 RUNS_DIR = STATE_DIR / "runs"
 VENVS_DIR = STATE_DIR / "venvs"
-KINDS = ("injector", "collector")
+KINDS = ("injector", "collector", "connector")
+# Folders of the OpenCTI connectors repository, each holding connectors of one type
+CONNECTOR_FAMILIES = {
+    "external-import": "EXTERNAL_IMPORT",
+    "internal-enrichment": "INTERNAL_ENRICHMENT",
+    "internal-import-file": "INTERNAL_IMPORT_FILE",
+    "internal-export-file": "INTERNAL_EXPORT_FILE",
+    "stream": "STREAM",
+}
 INSTALLED_MARKER = ".staticfire-installed"
 
 
@@ -40,6 +48,18 @@ class Component:
     name: str
     path: str
     module: str
+    # Connectors often run a script (python main.py) from their src/ folder instead of a module
+    script: str = ""
+    workdir: str = ""
+    connector_type: str = ""
+
+    @property
+    def argv_tail(self) -> list[str]:
+        return [self.script] if self.script else ["-m", self.module]
+
+    @property
+    def cwd(self) -> str:
+        return self.workdir or self.path
 
     @property
     def component_id(self) -> str:
@@ -62,6 +82,9 @@ class Component:
 def detect(path: str | Path, kind: str | None = None) -> Component:
     """Recognise an injector/collector checkout and the module its Docker image runs."""
     root = Path(path).expanduser().resolve()
+    family = CONNECTOR_FAMILIES.get(root.parent.name)
+    if kind == "connector" or (kind is None and family):
+        return _connector(root, family or "")
     if not (root / "pyproject.toml").exists():
         raise RunnerError(f"{root} has no pyproject.toml")
     if kind is None:
@@ -72,6 +95,45 @@ def detect(path: str | Path, kind: str | None = None) -> Component:
     if kind not in KINDS:
         raise RunnerError(f"Cannot tell if {root} is an injector or a collector, pass the kind")
     return Component(kind=kind, name=root.name, path=str(root), module=_module(root))
+
+
+def _connector(root: Path, connector_type: str) -> Component:
+    """An OpenCTI connector: its Docker image runs a script from src/ or ``python -m src``."""
+    src = root / "src"
+    entrypoint = root / "entrypoint.sh"
+    dockerfile = root / "Dockerfile"
+    script, module, workdir = "", "", str(src if src.is_dir() else root)
+    if entrypoint.exists() and (
+        m := re.findall(r"python3?\s+(?:-m\s+)?(\S+)", entrypoint.read_text())
+    ):
+        target = m[-1]
+        if re.search(r"python3?\s+-m\s+" + re.escape(target), entrypoint.read_text()):
+            module = target
+        else:
+            script = target
+    elif dockerfile.exists():
+        for line in reversed(dockerfile.read_text().splitlines()):
+            if not line.startswith(("CMD", "ENTRYPOINT")):
+                continue
+            if m := re.search(r'"-m",\s*"([^"]+)"', line):
+                module = m.group(1)
+                # "python -m src" runs from the connector root, where src/ is a package
+                workdir = str(root) if module.split(".")[0] == "src" else workdir
+                break
+            if m := re.search(r'"python3?",\s*"([^"]+\.py)"', line):
+                script = m.group(1)
+                break
+    if not (script or module):
+        raise RunnerError(f"No entry point found in {root} (entrypoint.sh or Dockerfile CMD)")
+    return Component(
+        kind="connector",
+        name=root.name,
+        path=str(root),
+        module=module,
+        script=script,
+        workdir=workdir,
+        connector_type=connector_type,
+    )
 
 
 def _module(root: Path) -> str:
@@ -112,6 +174,19 @@ def install(
         subprocess.run(["rm", "-rf", str(component.venv)], check=True)
     if not component.python.exists():
         _run(["uv", "venv", "--python", ".".join(map(str, python)), str(component.venv)])
+    if component.kind == "connector":
+        output = _run(
+            [
+                "uv",
+                "pip",
+                "install",
+                "--python",
+                str(component.python),
+                *_connector_requirements(root),
+            ]
+        )
+        (component.venv / INSTALLED_MARKER).write_text(component.path + "\n")
+        return output
     requirements = ["-e", str(root)]
     # Injectors depend on the shared injector_common package through a relative path
     if (
@@ -139,6 +214,8 @@ def _required_python(root: Path) -> tuple[int, int]:
     pyoaev declares >=3.11 but imports typing.override (3.12+): a 3.11 virtualenv installs
     fine and then fails at the first import.
     """
+    if not (root / "pyproject.toml").exists():
+        return (3, 12)
     project = tomllib.loads((root / "pyproject.toml").read_text()).get("project", {})
     m = re.search(r">=\s*3\.(\d+)", project.get("requires-python", ""))
     return (3, max(int(m.group(1)), 12) if m else 12)
@@ -154,6 +231,35 @@ def _venv_python(component: Component) -> tuple[int, int]:
         check=False,
     ).stdout.split()
     return (int(out[0]), int(out[1])) if len(out) == 2 else (0, 0)
+
+
+def _connector_requirements(root: Path) -> list[str]:
+    """What the connector's Dockerfile installs: src/requirements.txt or the project itself.
+
+    The connectors SDK is taken from the same checkout (its connectors-sdk folder) rather than
+    from GitHub's master, so a connector and the SDK it is tested with come from one tree.
+    """
+    requirements = []
+    sdk = next(
+        (p / "connectors-sdk" for p in root.parents if (p / "connectors-sdk").is_dir()), None
+    )
+    for candidate in (root / "src" / "requirements.txt", root / "requirements.txt"):
+        if not candidate.exists():
+            continue
+        lines = candidate.read_text().splitlines()
+        if sdk and any(line.strip().startswith("connectors-sdk") for line in lines):
+            local = [line for line in lines if not line.strip().startswith("connectors-sdk")]
+            rewritten = VENVS_DIR / f"requirements-{root.name}.txt"
+            rewritten.parent.mkdir(parents=True, exist_ok=True)
+            rewritten.write_text("\n".join(local) + "\n")
+            requirements += ["-r", str(rewritten), "-e", str(sdk)]
+        else:
+            requirements += ["-r", str(candidate)]
+    if (root / "pyproject.toml").exists():
+        requirements += ["-e", str(root)]
+    if not requirements:
+        raise RunnerError(f"No requirements.txt or pyproject.toml in {root}")
+    return requirements
 
 
 def _importable(component: Component, module: str) -> bool:
@@ -179,6 +285,16 @@ def _run(argv: list[str]) -> str:
 
 
 def base_env(component: Component, profile: Profile, log_level: str = "info") -> dict[str, str]:
+    if component.kind == "connector":
+        return {
+            "OPENCTI_URL": profile.opencti_url,
+            "OPENCTI_TOKEN": profile.opencti_token,
+            "CONNECTOR_ID": component.component_id,
+            "CONNECTOR_TYPE": component.connector_type,
+            "CONNECTOR_LOG_LEVEL": log_level,
+            # OpenCTI advertises its RabbitMQ by its Docker name: reach it on the platform host
+            "MQ_HOST": profile.host or "",
+        }
     prefix = component.kind.upper()
     env = {
         "OPENAEV_URL": profile.openaev_url,
@@ -240,8 +356,8 @@ def start(
     env = {**base_env(component, profile, log_level), **(extra_env or {})}
     return spawn(
         run_name or f"{component.kind}-{component.name}",
-        [str(component.python), "-u", "-m", component.module],
-        cwd=component.path,
+        [str(component.python), "-u", *component.argv_tail],
+        cwd=component.cwd,
         env=env,
         kind=component.kind,
         name=component.name,
