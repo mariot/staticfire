@@ -46,7 +46,8 @@ FAMILIES = (
 class ConnectorSpec:
     recipe: str
     connector: str  # "<family>/<name>" in the connectors repository
-    env: Callable[[Ofapi], dict[str, str]] = lambda fake: {}
+    # Settings; None leaves out one the recipe would set
+    env: Callable[[Ofapi], dict[str, str | None]] = lambda fake: {}
     rules: Callable[[Ofapi], list[Rule]] = lambda fake: []
     # STIX types the connector must send ("relationship:<type>" for a kind of relationship)
     expected_types: set[str] = field(default_factory=set)

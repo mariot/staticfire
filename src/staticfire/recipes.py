@@ -57,6 +57,28 @@ def checkout(repo: str, name: str, path: str | None = None) -> str:
     )
 
 
+def _literal_prefix(path: str) -> str:
+    """The literal start of a rule path (a regex when it starts with '^')."""
+    if not path.startswith("^"):
+        return path
+    return re.split(r"[\\.^$*+?{}\[\]|()]", path[1:], maxsplit=1)[0]
+
+
+def _reset_own(fake, paths) -> None:
+    """Forget ofapi's rules and journal under this test's own paths only: concurrent tests
+    (OpenCTI connectors) share the fake, a global reset would wipe their rules."""
+    for prefix in sorted({_literal_prefix(p) for p in paths}):
+        if prefix.strip("/"):
+            fake.reset(prefix)
+
+
+def _install_rules(fake, rules) -> None:
+    """Script the fake: each rule replaces any earlier one on its path."""
+    _reset_own(fake, [rule.path for rule in rules])
+    for rule in rules:
+        fake.rule(rule.path, [rule.response()], method=rule.method)
+
+
 def _clock_ok(report: Report, profile: Profile) -> bool:
     """Collectors judge expectations by age: refuse to run on a platform with a wrong clock."""
     problem = ops.clock_problem(profile)
@@ -378,13 +400,19 @@ def vendor_collector(
         if not _clock_ok(report, profile):
             return report
         fake = fakes.ofapi_up()
-        fake.reset()
+        _reset_own(fake, spec.calls)
         report.refs["vendor_fake"] = f"{fake.http_base} / {fake.base}"
-        made = ops.agent_expectations(profile, asset_id)
+        if spec.email:
+            made = _email_expectations(report, profile, asset_id)
+            if not made:
+                return report
+        else:
+            made = ops.agent_expectations(profile, asset_id)
         report.refs["inject_id"] = made["inject_id"]
         report.refs["inject"] = made["link"]
         report.refs["endpoint"] = f"{made['endpoint']['name']} ({made['endpoint']['asset_id']})"
-        report.check("agent executes the marker payload", made["status"] == "EXECUTED", made)
+        what = "email inject" if spec.email else "agent executes the marker payload"
+        report.check(f"{what} EXECUTED", made["status"] == "EXECUTED", made)
         report.evidence["pending_expectations"] = made["pending"]
         if not report.check(
             "expectations carry the implant process",
@@ -395,12 +423,12 @@ def vendor_collector(
         ):
             return report
         signals = _signals(made)
+        signals.email = made.get("email") or {}
         report.evidence["signals"] = signals.__dict__ | {
             "start": signals.start_iso,
             "end": signals.end_iso,
         }
-        for rule in spec.rules(signals, verdict):
-            fake.rule(rule.path, [rule.response()], method=rule.method)
+        _install_rules(fake, spec.rules(signals, verdict))
         up = _start(
             report,
             profile,
@@ -452,9 +480,62 @@ def vendor_collector(
             report.evidence["collector_log"] = _safe_tail(run_name)
         if not keep:
             runner.stop(run_name)
+            if spec.email:
+                runner.stop("injector-email-smtp")
             if fake and fake.started:
                 runner.stop(fakes.OFAPI_RUN)
     return report
+
+
+def _email_expectations(report: Report, profile: Profile, asset_id: str | None) -> dict | None:
+    """Email expectations for an email security collector: email-smtp delivers an inject
+    targeting the agent endpoint, its implant name in a body URL (email-smtp cannot place it:
+    the inject is edited, see mailpit_collector). Shaped like ops.agent_expectations, plus the
+    delivered message."""
+    endpoint = ops.agent_endpoint(profile, asset_id)
+    up = _start(report, profile, checkout("injectors", "email-smtp"), "injector")
+    if not up:
+        return None
+    api = ops.client(profile)
+    token = uuid.uuid4().hex[:10]
+    content = _email_content(profile, token)
+    content["expectations"] = ops.expectation_content(ops.TECHNICAL_EXPECTATIONS)
+    base = {
+        "inject_title": f"staticfire email expectations {token}",
+        "inject_injector_contract": up["contracts"][0]["contract_id"],
+        "inject_assets": [endpoint["asset_id"]],
+    }
+    inject_id = api.create_atomic_testing({**base, "inject_content": content})["inject_id"]
+    implants = [
+        f"{up['entity']['type']}{inject_id}-agent-{a['agent_id']}"
+        for a in endpoint["agents"]
+        if a["active"]
+    ]
+    _place_implants(api, content, implants, "url")
+    api.update_atomic_testing(inject_id, {**base, "inject_content": content})
+    result = ops.launch_and_wait(profile, inject_id, [endpoint["asset_id"]])
+    box = ops.mailpit(profile)
+    messages = box.wait_for(f'to:"{content["to"]}"', timeout=60)
+    if not report.check("email delivered to mailpit", messages, f"nothing for {content['to']}"):
+        return None
+    mail = box.describe(messages[0]["ID"])
+    report.refs["mailpit_message"] = f"{profile.mailpit_url}/view/{mail['id']}"
+    urls = re.findall(r"https?://\S+", mail["text"] or "")
+    return {
+        **result,
+        "inject_id": inject_id,
+        "endpoint": endpoint,
+        "pending": ops.pending_expectations(profile, inject_id),
+        "email": {
+            "from": content["from"],
+            "to": content["to"],
+            "cc": content["cc"],
+            "subject": content["subject"],
+            "urls": urls,
+            "message_id": mail.get("message_id") or f"<{token}@staticfire.test>",
+            "date": mail.get("date"),
+        },
+    }
 
 
 def vendor_injector(
@@ -477,12 +558,11 @@ def vendor_injector(
     fake = None
     try:
         fake = fakes.ofapi_up()
-        fake.reset()
+        _reset_own(fake, [path for _, path in spec.calls])
         stub_dir = injector_vendors.write_stubs(spec)
         endpoint = ops.agent_endpoint(profile) if spec.target_endpoint else None
         ctx = injector_vendors.Context(fake, uuid.uuid4().hex[:10], stub_dir, endpoint)
-        for rule in spec.rules(ctx):
-            fake.rule(rule.path, [rule.response()], method=rule.method)
+        _install_rules(fake, spec.rules(ctx))
         env = {
             **(fakes.component_proxy_env(fake, profile.host) if spec.proxy else {}),
             **spec.env(ctx),
@@ -560,7 +640,7 @@ def catalog_collector(
         if not _clock_ok(report, profile):
             return report
         fake = fakes.ofapi_up()
-        fake.reset()
+        _reset_own(fake, spec.calls)
         env = {
             **(fakes.component_proxy_env(fake, profile.host) if spec.proxy else {}),
             **spec.env(fake),
@@ -650,7 +730,7 @@ def ai_collector(
         if not _clock_ok(report, profile):
             return report
         fake = fakes.ofapi_up()
-        fake.reset()
+        _reset_own(fake, [*spec.calls, "/openai/v1/chat/completions"])
         if not _start(report, profile, injector, "injector"):
             return report
         # The collector registers its security platform: it must exist before the launch
@@ -693,8 +773,7 @@ def ai_collector(
             launch=False,
         )
         inject_id = created["inject_id"]
-        for rule in spec.rules(inject_id, verdict):
-            fake.rule(rule.path, [rule.response()], method=rule.method)
+        _install_rules(fake, spec.rules(inject_id, verdict))
         result = ops.launch_and_wait(profile, inject_id, timeout=timeout)
         report.refs["inject_id"] = inject_id
         report.refs["inject"] = result["link"]
@@ -863,6 +942,8 @@ def connector_test(
             **compose,
             **env,
         }
+        # a spec giving None leaves the variable out (a setting the connector refuses)
+        env = {name: value for name, value in env.items() if value is not None}
         # Every run starts from a blank state (two specs of one connector share its id)
         cti.reset_state(runner.detect(str(connector_dir), "connector").component_id)
         started = time.time()
@@ -1147,10 +1228,15 @@ def run_recipe(profile: Profile, name: str, **options) -> Report:
     report = fn(profile, **{k: v for k, v in options.items() if k in accepted and v})
     try:
         # Connector recipes may run concurrently: only their own run's component log is theirs
+        # and OpenAEV recipes run beside them: leave the connectors' logs out of their review
         own = (
             [f"connector-{Path(connector_vendors.SPECS[name].connector).name}"]
             if (platform == "opencti")
-            else None
+            else [
+                d.name
+                for d in (runner.RUNS_DIR.iterdir() if runner.RUNS_DIR.exists() else [])
+                if not d.name.startswith("connector-")
+            ]
         )
         logs = logscan.review(log_profile, started_at, skew, platform, runs=own)
         report.evidence["logs"] = logs
