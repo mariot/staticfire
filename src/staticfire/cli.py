@@ -2,15 +2,15 @@
 
 from __future__ import annotations
 
-import inspect
 import json
 import sys
+import time
 from pathlib import Path
 from typing import Annotated
 
 import typer
 
-from staticfire import config, fakes, ops, recipes, runner
+from staticfire import config, fakes, logscan, ops, recipes, runner
 from staticfire.openaev import OpenAEVError
 
 app = typer.Typer(
@@ -173,6 +173,16 @@ def down(target: Annotated[str, typer.Argument(help="Run name or checkout path")
 def runs():
     """Injectors and collectors started by staticfire."""
     _print([r.summary() for r in runner.list_runs()])
+
+
+@app.command("review-logs")
+def review_logs(
+    minutes: Annotated[float, typer.Option(help="How far back to look")] = 60,
+    profile: ProfileOpt = None,
+):
+    """Warnings and errors logged by components and the platform in the last minutes."""
+    p = _profile(profile)
+    _print(logscan.review(p, time.time() - minutes * 60, ops.client(p).clock_skew()))
 
 
 @app.command()
@@ -379,17 +389,16 @@ def fire(
         return
     if recipe not in recipes.RECIPES:
         raise typer.BadParameter(f"Unknown recipe {recipe}, known: {list(recipes.RECIPES)}")
-    fn = recipes.RECIPES[recipe]
-    options = {
-        "keep": keep,
-        "injector_path": injector_path,
-        "collector_path": collector_path,
-        "pyoaev": pyoaev,
-        "verdict": verdict,
-        "carrier": carrier,
-    }
-    accepted = inspect.signature(fn).parameters
-    result = fn(_profile(profile), **{k: v for k, v in options.items() if k in accepted and v})
+    result = recipes.run_recipe(
+        _profile(profile),
+        recipe,
+        keep=keep,
+        injector_path=injector_path,
+        collector_path=collector_path,
+        pyoaev=pyoaev,
+        verdict=verdict,
+        carrier=carrier,
+    )
     _print(result.to_dict() if as_json else result.summary())
     raise typer.Exit(0 if result.verdict == "PASS" else 1)
 
@@ -410,7 +419,7 @@ def matrix_cmd(
         detail = row["error"] or ", ".join(row["failed"])
         typer.echo(
             f"{row['result']:5} {row['recipe']:24} {row['verdict']:10} "
-            f"{row['duration_s']:6.1f}s {detail}"
+            f"{row['duration_s']:6.1f}s [{row['logs']}] {detail}"
         )
 
     rows = recipes.matrix(_profile(profile), names, all_verdicts, Path(out) if out else None, show)

@@ -6,13 +6,12 @@ Every tool takes an optional ``profile`` (default: the current staticfire profil
 
 from __future__ import annotations
 
-import inspect
 import logging
 from typing import Any
 
 from mcp.server.mcpserver import MCPServer
 
-from staticfire import config, fakes, ops, recipes, runner
+from staticfire import config, fakes, logscan, ops, recipes, runner
 
 mcp = MCPServer(
     "staticfire",
@@ -60,17 +59,16 @@ def fire_recipe(
     verdict (cortex-xdr): what the scripted XDR reports, prevented, detected or none.
     carrier (mailpit-collector): where the email carries its implant name, header, url,
     attachment, all, or none (negative case: nothing must be answered)."""
-    fn = recipes.RECIPES[recipe]
-    options = {
-        "keep": keep,
-        "injector_path": injector_path,
-        "collector_path": collector_path,
-        "pyoaev": pyoaev,
-        "verdict": verdict,
-        "carrier": carrier,
-    }
-    accepted = inspect.signature(fn).parameters
-    return fn(_p(profile), **{k: v for k, v in options.items() if k in accepted and v}).to_dict()
+    return recipes.run_recipe(
+        _p(profile),
+        recipe,
+        keep=keep,
+        injector_path=injector_path,
+        collector_path=collector_path,
+        pyoaev=pyoaev,
+        verdict=verdict,
+        carrier=carrier,
+    ).to_dict()
 
 
 @mcp.tool()
@@ -225,6 +223,16 @@ def vendor_fake(action: str = "up", path: str = "", limit: int = 20) -> dict | l
     if action == "down":
         return {"stopped": runner.stop(fakes.OFAPI_RUN)}
     raise ValueError(f"Unknown action {action}")
+
+
+@mcp.tool()
+def review_logs(minutes: float = 60, profile: str | None = None) -> dict:
+    """Warnings and errors logged by the components staticfire ran and by the platform in the
+    last minutes, each distinct message once with its count."""
+    import time
+
+    p = _p(profile)
+    return logscan.review(p, time.time() - minutes * 60, ops.client(p).clock_skew())
 
 
 @mcp.tool()

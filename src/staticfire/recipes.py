@@ -7,6 +7,7 @@ they need from their checkouts and stop them afterwards unless ``keep`` is set.
 from __future__ import annotations
 
 import functools
+import inspect
 import json
 import os
 import re
@@ -20,6 +21,7 @@ from staticfire import (
     catalog_vendors,
     fakes,
     injector_vendors,
+    logscan,
     ops,
     runner,
     vendors,
@@ -781,6 +783,25 @@ def verdicts_of(name: str) -> list[str | None]:
     return [None]
 
 
+def run_recipe(profile: Profile, name: str, **options) -> Report:
+    """Run a recipe, then review the warnings and errors logged meanwhile (components, platform)."""
+    started_at = time.time()
+    try:
+        skew = ops.client(profile).clock_skew()
+    except Exception:
+        skew = 0.0
+    fn = RECIPES[name]
+    accepted = inspect.signature(fn).parameters
+    report = fn(profile, **{k: v for k, v in options.items() if k in accepted and v})
+    try:
+        logs = logscan.review(profile, started_at, skew)
+        report.evidence["logs"] = logs
+        report.refs["logs"] = logscan.one_line(logs)
+    except Exception as err:  # the review must never hide the recipe's own verdict
+        report.refs["logs"] = f"not reviewed: {err}"
+    return report
+
+
 def matrix(
     profile: Profile,
     names: list[str] | None = None,
@@ -792,9 +813,7 @@ def matrix(
     rows = []
     for name in names or list(RECIPES):
         for verdict in verdicts_of(name) if all_verdicts else [None]:
-            fn = RECIPES[name]
-            kwargs = {"verdict": verdict} if verdict else {}
-            report = fn(profile, **kwargs)
+            report = run_recipe(profile, name, verdict=verdict)
             row = {
                 "recipe": name,
                 "verdict": verdict or "",
@@ -802,6 +821,7 @@ def matrix(
                 "duration_s": report.to_dict()["duration_s"],
                 "failed": [c.name for c in report.checks if not c.ok],
                 "error": report.error,
+                "logs": report.refs.get("logs", ""),
             }
             if out_dir:
                 out_dir.mkdir(parents=True, exist_ok=True)
