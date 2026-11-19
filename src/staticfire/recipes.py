@@ -826,7 +826,11 @@ def connector_test(
         if spec.family == "internal-enrichment":
             env["CONNECTOR_AUTO"] = "false"
         if spec.family == "stream":
-            env["CONNECTOR_LIVE_STREAM_ID"] = cti.live_stream()
+            env["CONNECTOR_LIVE_STREAM_ID"] = (
+                cti.live_stream(f"staticfire-{spec.recipe}", spec.stream_filters)
+                if spec.stream_filters
+                else cti.live_stream()
+            )
             env["CONNECTOR_LIVE_STREAM_LISTEN_DELETE"] = "true"
             env["CONNECTOR_LIVE_STREAM_NO_DEPENDENCIES"] = "true"
         # pycti also writes every bundle it sends here: what the connector produced

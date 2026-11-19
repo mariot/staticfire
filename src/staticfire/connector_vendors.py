@@ -63,6 +63,9 @@ class ConnectorSpec:
     # an indicator by default
     export: tuple[str, str] | None = None
     export_object: Callable[[Any], tuple[str, str]] | None = None
+    # stream: filters (an OpenCTI FilterGroup) of a live stream of its own, for a connector that
+    # cannot take every event of the shared one
+    stream_filters: dict | None = None
     # stream: creates objects once the connector listens and returns values unique to them,
     # which must show in what the vendor receives (by default an indicator on a new domain
     # and a new IPv4 observable)
@@ -103,7 +106,10 @@ def compose_defaults(connector_dir: Path) -> dict[str, str]:
     for service in services.values():
         environment = (service or {}).get("environment") or {}
         if isinstance(environment, list):
-            environment = dict(item.split("=", 1) for item in environment if "=" in str(item))
+            # an item YAML reads as a mapping is not a valid compose entry: skipped
+            environment = dict(
+                item.split("=", 1) for item in environment if isinstance(item, str) and "=" in item
+            )
         for name, value in environment.items():
             value = "" if value is None else str(value)
             if isinstance(environment.get(name), bool):

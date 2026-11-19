@@ -333,8 +333,8 @@ class OpenCTI:
             {"input": {"name": name, "description": "staticfire export test"}},
         )["intrusionSetAdd"]
 
-    def live_stream(self, name: str = "staticfire") -> str:
-        """The id of a live stream with every change (created once)."""
+    def live_stream(self, name: str = "staticfire", filters: dict | None = None) -> str:
+        """The id of a live stream (every change, or what ``filters`` keep), created once."""
         edges = self.graphql(
             """query ($search: String) { streamCollections(search: $search) {
                  edges { node { id name } } } }""",
@@ -351,7 +351,9 @@ class OpenCTI:
                     "stream_live": True,
                     "description": "staticfire",
                     # without filters OpenCTI answers 500 to the stream's readers
-                    "filters": json.dumps({"mode": "and", "filters": [], "filterGroups": []}),
+                    "filters": json.dumps(
+                        filters or {"mode": "and", "filters": [], "filterGroups": []}
+                    ),
                 }
             },
         )["streamCollectionAdd"]["id"]
