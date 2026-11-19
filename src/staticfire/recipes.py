@@ -554,10 +554,14 @@ def catalog_collector(
 
         def settled() -> bool:
             nonlocal last
+            # Data left by an earlier run would pass at once: wait for this run's fetch too
+            if not all(fake.journal(path) for path in spec.calls):
+                return False
             last = spec.checks(api, collector_id)
             return all(ok for _, ok, _ in last)
 
         wait_until(settled, timeout or spec.timeout, 10)
+        last = last or spec.checks(api, collector_id)
         for name, ok, detail in last:
             report.check(name, ok, detail)
         for path in spec.calls:

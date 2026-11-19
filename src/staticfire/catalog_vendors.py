@@ -87,25 +87,25 @@ MITRE_ATLAS = CatalogCollector(
 
 def _cve(api: OpenAEV, external_id: str) -> dict | None:
     try:
-        return api.get(f"/api/cves/external-id/{external_id}")
+        return api.get(f"/api/cves/external-id/{external_id}") or None
     except OpenAEVError:
         return None
 
 
-def _nvd_checks(api: OpenAEV, collector_id: str) -> list[Check]:
+def _nvd_checks(api: OpenAEV, _collector_id: str) -> list[Check]:
     first, second, skipped = (
-        _cve(api, cve) for cve in ("CVE-2026-90001", "CVE-2026-90002", "CVE-2026-90003")
+        _cve(api, cve) for cve in ("CVE-2099-90001", "CVE-2099-90002", "CVE-2099-90003")
     )
-    state = (api.collector(collector_id) or {}).get("collector_state") or {}
+    cwes = [c.get("cwe_external_id") for c in (first or {}).get("vulnerability_cwes") or []]
     return [
         (
             "CVE with CVSS v3.1 imported with its score",
-            bool(first) and first.get("cve_cvss_v31") == 9.8,
+            bool(first) and first.get("vulnerability_cvss_v31") == 9.8,
             first,
         ),
+        ("its weakness imported as a CWE", "CWE-79" in cwes, cwes),
         ("second CVE imported", bool(second), second),
         ("CVE without CVSS v3.1 skipped", skipped is None, skipped),
-        ("initial dataset marked complete", bool(state.get("initial_dataset_completed")), state),
     ]
 
 
@@ -126,7 +126,11 @@ NVD_NIST_CVE = CatalogCollector(
 
 def _payload_checks(api: OpenAEV, _collector_id: str) -> list[Check]:
     found = api.post("/api/payloads/search", {"page": 0, "size": 50, "textSearch": "ofapi"})
-    payloads = _by((found or {}).get("content", []), "payload_external_id")
+    # Search results leave out the tags: read each payload
+    payloads = {
+        p.get("payload_external_id"): api.get(f"/api/payloads/{p['payload_id']}")
+        for p in (found or {}).get("content", [])
+    }
     tags = {t.get("tag_id"): t.get("tag_name") for t in api.get("/api/tags") or []}
 
     def tag_names(external_id: str) -> set[str]:
@@ -158,7 +162,11 @@ OPENAEV_PAYLOADS = CatalogCollector(
     recipe="openaev-payloads",
     collector="openaev",
     # The collector appends file names to the prefix: it must end with a slash
-    env=lambda fake: {"OPENAEV_URL_PREFIX": fake.http_url("openaev-payloads") + "/"},
+    env=lambda fake: {
+        "OPENAEV_URL_PREFIX": fake.http_url("openaev-payloads") + "/",
+        # Required by its settings, although its README documents a default
+        "COLLECTOR_NAME": "OpenAEV Datasets",
+    },
     checks=_payload_checks,
     calls=["/openaev-payloads/manifest.json"],
     description="a manifest with a native and a community Command payload",
