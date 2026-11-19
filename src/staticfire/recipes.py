@@ -72,6 +72,22 @@ def _reset_own(fake, paths) -> None:
             fake.reset(prefix)
 
 
+# ofapi prefixes several vendors' tests use (modules shared by every Microsoft, Google... fake)
+SHARED_PREFIXES = {
+    "/microsoft-graph",
+    "/microsoft-login",
+    "/microsoft-identity",
+    "/google-identity",
+    "/google-oauth2",
+    "/github",
+    "/aws",
+}
+
+
+def _root(path: str) -> str:
+    return "/" + _literal_prefix(path).strip("/").split("/")[0]
+
+
 def _install_rules(fake, rules) -> None:
     """Script the fake: each rule replaces any earlier one on its path."""
     _reset_own(fake, [rule.path for rule in rules])
@@ -395,6 +411,7 @@ def vendor_collector(
     report = Report(f"{spec.recipe} ({verdict})")
     collector = checkout("collectors", spec.collector, collector_path)
     run_name = f"collector-{Path(collector).name}"
+    edr_run = None
     fake = None
     try:
         if not _clock_ok(report, profile):
@@ -411,8 +428,8 @@ def vendor_collector(
         report.refs["inject_id"] = made["inject_id"]
         report.refs["inject"] = made["link"]
         report.refs["endpoint"] = f"{made['endpoint']['name']} ({made['endpoint']['asset_id']})"
-        what = "email inject" if spec.email else "agent executes the marker payload"
-        report.check(f"{what} EXECUTED", made["status"] == "EXECUTED", made)
+        what = "email inject EXECUTED" if spec.email else "agent executes the marker payload"
+        report.check(what, made["status"] == "EXECUTED", made)
         report.evidence["pending_expectations"] = made["pending"]
         if not report.check(
             "expectations carry the implant process",
@@ -428,6 +445,11 @@ def vendor_collector(
             "start": signals.start_iso,
             "end": signals.end_iso,
         }
+        if spec.edr:
+            edr_dir = checkout("collectors", vendors.SPECS[spec.edr].collector)
+            edr_run = f"collector-{Path(edr_dir).name}"
+            if not _edr_first(report, profile, fake, spec.edr, verdict, made, signals, timeout):
+                return report
         _install_rules(fake, spec.rules(signals, verdict))
         up = _start(
             report,
@@ -478,13 +500,68 @@ def vendor_collector(
     finally:
         if report.verdict != "PASS":
             report.evidence["collector_log"] = _safe_tail(run_name)
+        if report.verdict != "PASS" and edr_run:
+            report.evidence["edr_collector_log"] = _safe_tail(edr_run)
         if not keep:
             runner.stop(run_name)
+            if edr_run:
+                runner.stop(edr_run)
             if spec.email:
                 runner.stop("injector-email-smtp")
             if fake and fake.started:
                 runner.stop(fakes.OFAPI_RUN)
     return report
+
+
+def _edr_first(
+    report: Report,
+    profile: Profile,
+    fake,
+    edr: str,
+    verdict: str,
+    made: dict,
+    signals: vendors.Signals,
+    timeout: float,
+) -> bool:
+    """Run the EDR collector a SIEM chains on (its own spec, same verdict) until it answered
+    what that verdict implies; record the alertIds it left in its results."""
+    spec = vendors.SPECS[edr]
+    signals.edr = edr
+    _reset_own(fake, spec.calls)
+    _install_rules(fake, spec.rules(signals, verdict))
+    up = _start(
+        report,
+        profile,
+        checkout("collectors", spec.collector),
+        f"edr_{edr}",
+        kind="collector",
+        env={
+            **(fakes.component_proxy_env(fake, profile.host) if spec.proxy else {}),
+            **spec.env(fake),
+            "COLLECTOR_PERIOD": spec.period,
+        },
+    )
+    if not up:
+        return False
+    edr_id = up["component"]["id"]
+    asset = made["endpoint"]["asset_id"]
+    answered = tuple(t for t, r in spec.expected[verdict].items() if r)
+    if answered:
+        done, expectations = ops.wait_expectations(
+            profile, made["inject_id"], asset, edr_id, answered, timeout
+        )
+        report.check(f"{edr} answers {', '.join(answered)} first", done)
+    else:
+        wait_until(lambda: False, 30, 5)
+        expectations = ops.expectations_of_target(ops.client(profile), made["inject_id"], asset)
+    results = [
+        r for e in expectations for r in e["results"] if r["source_id"] == edr_id and r["result"]
+    ]
+    report.evidence["edr_results"] = results
+    signals.edr_alert_ids = sorted(
+        {str((r.get("metadata") or {}).get("alertId")) for r in results} - {"None"}
+    )
+    return True
 
 
 def _email_expectations(report: Report, profile: Profile, asset_id: str | None) -> dict | None:
@@ -641,6 +718,8 @@ def catalog_collector(
             return report
         fake = fakes.ofapi_up()
         _reset_own(fake, spec.calls)
+        if spec.setup:
+            spec.setup(ops.client(profile), fake)
         env = {
             **(fakes.component_proxy_env(fake, profile.host) if spec.proxy else {}),
             **spec.env(fake),
@@ -651,11 +730,15 @@ def catalog_collector(
         collector_id = up["component"]["id"]
         api = ops.client(profile)
         last: list = []
+        # Calls are kept once seen: the shared journal rotates under concurrent tests
+        seen: dict[str, list] = {}
 
         def settled() -> bool:
             nonlocal last
+            for path in spec.calls:
+                seen[path] = seen.get(path) or fake.journal(path)[:2]
             # Data left by an earlier run would pass at once: wait for this run's fetch too
-            if not all(fake.journal(path) for path in spec.calls):
+            if not all(seen.values()):
                 return False
             last = spec.checks(api, collector_id)
             return all(ok for _, ok, _ in last)
@@ -665,7 +748,7 @@ def catalog_collector(
         for name, ok, detail in last:
             report.check(name, ok, detail)
         for path in spec.calls:
-            calls = fake.journal(path)
+            calls = seen.get(path) or fake.journal(path)
             report.evidence.setdefault("source_calls", {})[path] = calls[:2]
             report.check(f"collector fetched {path}", calls, "no call recorded")
     except Exception as err:
@@ -900,10 +983,14 @@ def connector_test(
         # ofapi and the proxy are shared by concurrent tests: started once, never stopped here
         fake = fakes.ofapi_up()
         report.refs["ofapi_reloaded"] = fake.reload()
-        for prefix in {"/" + c.strip("/").split("/")[0] for c in spec.calls}:
+        roots = {"/" + c.strip("/").split("/")[0] for c in spec.calls}
+        # A vendor's own prefix is reset whole; one shared by several vendors (Graph, GitHub,
+        # AWS...) only on this test's paths, or it would wipe a concurrent test's rules
+        for prefix in roots - SHARED_PREFIXES:
             fake.reset(prefix)
-        for rule in spec.rules(fake):
-            fake.rule(rule.path, [rule.response()], method=rule.method)
+        rules = spec.rules(fake)
+        _reset_own(fake, [c for c in spec.calls if _root(c) in SHARED_PREFIXES])
+        _install_rules(fake, rules)
         user_id, token = _service_token(profile, cti, f"staticfire-{spec.recipe}")
         env = {
             "OPENCTI_TOKEN": token,
@@ -911,17 +998,23 @@ def connector_test(
             "CONNECTOR_NAME": f"staticfire {connector_dir.name}",
             "CONNECTOR_DURATION_PERIOD": "PT1H",
             "CONNECTOR_RUN_AND_TERMINATE": "false",
+            # from the spec: a copy of the connector (--connector-path) is not in a family folder
+            "CONNECTOR_TYPE": runner.CONNECTOR_FAMILIES[spec.family],
             # the setting production should use (pycti warns about its default)
             "OPENCTI_TLS_REJECT_UNAUTHORIZED": "true",
         }
         if spec.family == "internal-enrichment":
             env["CONNECTOR_AUTO"] = "false"
         if spec.family == "stream":
-            env["CONNECTOR_LIVE_STREAM_ID"] = (
-                cti.live_stream(f"staticfire-{spec.recipe}", spec.stream_filters)
-                if spec.stream_filters
-                else cti.live_stream()
-            )
+            if spec.stream_filters:
+                stream_id = cti.live_stream(f"staticfire-{spec.recipe}", spec.stream_filters)
+            elif spec.stream is None:
+                # only the test's own objects: the whole platform's changes flood a connector
+                # opening a connection per event (and other tests' objects are not its concern)
+                stream_id = cti.live_stream(STREAM_LABEL, _labelled(cti.label(STREAM_LABEL)))
+            else:
+                stream_id = cti.live_stream()
+            env["CONNECTOR_LIVE_STREAM_ID"] = stream_id
             env["CONNECTOR_LIVE_STREAM_LISTEN_DELETE"] = "true"
             env["CONNECTOR_LIVE_STREAM_NO_DEPENDENCIES"] = "true"
         # pycti also writes every bundle it sends here: what the connector produced
@@ -1098,9 +1191,14 @@ def _sent_types(bundles_dir: Path) -> list[str]:
     return sorted(filter(None, types))
 
 
+def _journal_since(fake, path: str, since: float) -> list[dict]:
+    """ofapi's journal under ``path`` since a time: concurrent tests share the fake."""
+    return [e for e in fake.journal(path) if ops.parse_date(e["at"]).timestamp() >= since - 1]
+
+
 def _vendor_call_checks(report: Report, fake, spec) -> None:
     for path in spec.calls:
-        calls = fake.journal(path)
+        calls = _journal_since(fake, path, report.started_at)
         report.evidence.setdefault("vendor_calls", {})[path] = calls[:2]
         report.check(f"connector called {path}", calls, None if calls else "no call recorded")
     unrouted = {e["path"].split("/")[2] for e in fake.journal("/_unrouted/")}
@@ -1117,7 +1215,7 @@ def _stream_checks(report: Report, cti, fake, spec, timeout: float | None) -> No
     report.refs["markers"] = markers
 
     def forwarded() -> list[dict] | None:
-        calls = [e for path in spec.calls for e in fake.journal(path)]
+        calls = [e for path in spec.calls for e in _journal_since(fake, path, report.started_at)]
         return [e for e in calls if any(m in json.dumps(e) for m in markers)] or None
 
     _, found = wait_until(forwarded, timeout or spec.timeout, 5)
@@ -1129,13 +1227,28 @@ def _stream_checks(report: Report, cti, fake, spec, timeout: float | None) -> No
     report.check(f"the vendor received the new objects ({', '.join(markers)})", found, None)
 
 
+# The label of the objects stream tests create, and the name of the live stream keeping only them
+STREAM_LABEL = "staticfire-stream"
+
+
+def _labelled(label_id: str) -> dict:
+    return {
+        "mode": "and",
+        "filters": [{"key": ["objectLabel"], "values": [label_id], "operator": "eq"}],
+        "filterGroups": [],
+    }
+
+
 def _default_stream_objects(cti) -> list[str]:
     """An indicator on a new domain and a new IPv4 observable; their values as markers."""
     token = uuid.uuid4().hex[:8]
     domain = f"sf-{token}.example.com"
     ip = f"198.51.{int(token[:2], 16) % 256}.{int(token[2:4], 16) % 254 + 1}"
-    cti.create_indicator(f"staticfire {domain}", f"[domain-name:value = '{domain}']", "Domain-Name")
-    cti.create_observable("IPv4-Addr", ip)
+    labels = [cti.label(STREAM_LABEL)]
+    cti.create_indicator(
+        f"staticfire {domain}", f"[domain-name:value = '{domain}']", "Domain-Name", labels=labels
+    )
+    cti.create_observable("IPv4-Addr", ip, labels=labels)
     return [domain, ip]
 
 

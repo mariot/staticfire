@@ -347,11 +347,19 @@ class OpenCTI:
         """The id of a live stream (every change, or what ``filters`` keep), created once."""
         edges = self.graphql(
             """query ($search: String) { streamCollections(search: $search) {
-                 edges { node { id name } } } }""",
+                 edges { node { id name filters } } } }""",
             {"search": name},
         )["streamCollections"]["edges"]
-        if found := next((e["node"]["id"] for e in edges if e["node"]["name"] == name), None):
-            return found
+        wanted = json.dumps(filters or {"mode": "and", "filters": [], "filterGroups": []})
+        if found := next((e["node"] for e in edges if e["node"]["name"] == name), None):
+            if json.loads(found.get("filters") or "null") != json.loads(wanted):
+                # the spec changed its filters since the stream was created
+                self.graphql(
+                    """mutation ($id: ID!, $input: [EditInput]!) {
+                         streamCollectionEdit(id: $id) { fieldPatch(input: $input) { id } } }""",
+                    {"id": found["id"], "input": [{"key": "filters", "value": [wanted]}]},
+                )
+            return found["id"]
         return self.graphql(
             """mutation ($input: StreamCollectionAddInput!) {
                  streamCollectionAdd(input: $input) { id } }""",
@@ -361,9 +369,7 @@ class OpenCTI:
                     "stream_live": True,
                     "description": "staticfire",
                     # without filters OpenCTI answers 500 to the stream's readers
-                    "filters": json.dumps(
-                        filters or {"mode": "and", "filters": [], "filterGroups": []}
-                    ),
+                    "filters": wanted,
                 }
             },
         )["streamCollectionAdd"]["id"]
