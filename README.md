@@ -1,9 +1,10 @@
 # staticfire
 
 A static fire is the test where a rocket engine is fired while held on the pad, before launch.
-staticfire does that for OpenAEV injectors and collectors: it runs one from its checkout against a
-**real OpenAEV platform** and checks every effect it can observe (inject status and traces, the
-email that was delivered, the expectation results and traces a collector pushed).
+staticfire does that for OpenAEV injectors and collectors and for OpenCTI connectors: it runs one
+from its checkout against a **real platform** and checks every effect it can observe (inject
+status and traces, the email that was delivered, the expectation results and traces a collector
+pushed; the works of a connector and the STIX it sent).
 
 It sits next to [Mars](../mars) (cloud VMs) and [Liftoff](../liftoff) (deployment): Liftoff
 deploys the platform, staticfire fires components at it. It complements Mimikyu and ofapi, which
@@ -76,6 +77,45 @@ vendor answers (or stub) for each verdict, and what must be observed.
 
 `--injector-path` / `--collector-path` test another checkout (a PR branch in a worktree, for
 instance); `--pyoaev ../client-python` runs the component on a local pyoaev.
+
+## OpenCTI connectors
+
+Every connector of the connectors repository has a recipe named after its directory
+(`staticfire fire hunt-io`, `staticfire matrix --connectors --jobs 4`). The platform is an
+OpenCTI deployed by Liftoff (`just deploy-opencti`, then `staticfire profile from-multipass
+<vm> --name staticfire-cti`); connector recipes use the first profile holding an OpenCTI.
+
+How a connector test works:
+
+- **The vendor is ofapi, whatever the connector's URL**: the connector's HTTP(S) goes through a
+  TLS-intercepting proxy (mitmproxy, `proxy_addon.py`, started on `127.0.0.1:8899` with ofapi)
+  which sends each request to the ofapi vendor module declaring its host (`HOSTS` in
+  `ofapi/app/vendors/<vendor>.py`). Hardcoded vendor URLs and SDKs need no setting; a host no
+  fake claims lands in ofapi's journal under `/_unrouted/<host>/`, and nothing leaves the machine.
+  The connector trusts the proxy through `REQUESTS_CA_BUNDLE`, `SSL_CERT_FILE`, `AWS_CA_BUNDLE`...
+- **Its family decides how it is driven**: an external import runs once; an enrichment is asked
+  for an object created for the test; a file import gets a file from ofapi's `/fixtures/`
+  (STIX bundle, PDF or text report, MISP event, YARA rules, Navigator layer); an export exports an
+  indicator, a report or an intrusion set; a stream connector listens to a live stream while
+  objects with unique values are created, and those values must reach its vendor.
+- **What it produced is read from its own bundles**: pycti also writes every bundle it sends
+  (`CONNECTOR_SEND_TO_DIRECTORY`), so the expected STIX types are checked on what the connector
+  sent, whatever OpenCTI already held. Its works must complete without error.
+- **Each connector runs under its own OpenCTI service account** (`staticfire-<recipe>`, group
+  Connectors, token kept in `~/.local/state/staticfire/opencti-users.json`), so its writes are
+  attributable; the report lists what it created or updated.
+- Settings: the recipe's own (OpenCTI, name, `CONNECTOR_DURATION_PERIOD`, `CONNECTOR_AUTO=false`,
+  the live stream), the connector's docker-compose environment (connectors without a config
+  schema read config.yml, which a test has not), a placeholder for every required setting of its
+  config schema, then the spec's.
+- The log review covers the connector's log, OpenCTI's and the workers' (where ingestion errors
+  show).
+- Connectors are independent: `--jobs` runs several at once (ofapi's rules and journal are reset
+  per vendor prefix). A connector that cannot run offline has a spec saying why and reports
+  `SKIP`.
+
+Specs live in `src/staticfire/connectors/` (one module per connector), vendor fakes in ofapi's
+`app/vendors/` (one module per vendor, loaded live by `POST /_control/reload`).
 
 ## Building blocks
 
