@@ -1085,6 +1085,15 @@ def run_recipe(profile: Profile, name: str, **options) -> Report:
         logs = logscan.review(log_profile, started_at, skew, platform, runs=own)
         report.evidence["logs"] = logs
         report.refs["logs"] = logscan.one_line(logs)
+        if platform == "opencti" and not report.skipped:
+            # Connectors often catch their own failures and still complete their work
+            errors = [
+                entry["message"]
+                for review in logs["components"].values()
+                for entry in review["distinct"]
+                if entry["level"] in ("ERROR", "CRITICAL", "FATAL")
+            ]
+            report.check("the connector logged no error", not errors, errors[:5])
     except Exception as err:  # the review must never hide the recipe's own verdict
         report.refs["logs"] = f"not reviewed: {err}"
     return report
