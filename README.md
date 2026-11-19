@@ -50,13 +50,29 @@ Each recipe starts what it needs, checks every step and prints a verdict (`PASS`
 with links to the inject in OpenAEV and the message in mailpit; `--json` gives the full report
 with its evidence (traces, delivered message, expectation results, logs on failure). The exit code
 is 0 on `PASS`. Components are stopped at the end unless `--keep`; the vendor fake only if the
-recipe started it.
+recipe started it. ofapi is served on `http://127.0.0.1:8000` and `https://127.0.0.1:8443` by one
+process, so both share its scripted rules and journal.
 
-| Recipe | What is fired | What is checked |
-|---|---|---|
-| `email-smtp` | `injectors/email-smtp` sends a crafted email through mailpit | inject `EXECUTED`, injector `COMPLETE` trace, message delivered with the sender, To/Cc, subject, body and `X-OpenAEV-*` header of the inject |
-| `mailpit-collector` | email injects targeting an agent endpoint with DETECTION/PREVENTION expectations, their implant name written in an `X-OpenAEV-Implant` header, a body URL or an attachment (`--carrier header\|url\|attachment\|all`, `none` for the negative case); `collectors/mailpit` (this repo) plays the email security platform | per carrier: the email carries the implant, the collector answers `Detected` / `Not Prevented` and records the carrier it matched; with `none` it answers nothing |
-| `cortex-xdr` | the agent runs a marker command; ofapi plays Cortex XDR and reports alerts on that implant; `collectors/palo-alto-cortex-xdr` runs against both | `--verdict prevented`: `Detected` + `Prevented`; `detected`: `Detected`, prevention left pending; `none`: nothing answered. The collector must have queried the XDR alerts API |
+There are 33 recipes in five families; `staticfire fire` lists them with a one-line description.
+
+| Family | Recipes | How it works | Defined in |
+|---|---|---|---|
+| Email | `email-smtp`, `mailpit-collector` | `email-smtp` sends through mailpit; the mailpit collector (`collectors/mailpit`, this repo) answers email injects whose implant name sits in a header, a body URL or an attachment (`--carrier header\|url\|attachment\|all\|none`) | `recipes.py` |
+| EDR / XDR / SIEM collectors | `cortex-xdr`, `cortex-xsoar`, `crowdstrike`, `sentinelone`, `tanium`, `elastic`, `logrhythm`, `netwitness`, `qradar`, `splunk-es` | the agent runs a harmless marker command; ofapi answers the collector with vendor data built from the real expectation signals for `--verdict prevented\|detected\|none`; the collector must report that verdict and have queried its vendor | `vendors.py` |
+| AI defense | `lakera-guard`, `cisco-ai-defense`, `hiddenlayer`, `prisma-airs`, `prompt-security`, `xtm-one` | `ai-redteam` attacks ofapi's OpenAI-compatible model through an AI target; the firewall's verdict (`--verdict blocked\|flagged\|clean`) is scripted on ofapi; the collector must answer the agentless expectations | `ai_vendors.py` |
+| Vendor injectors | `censys`, `shodan`, `slack`, `teams`, `email-google-workspace`, `email-m365`, `nmap`, `netexec`, `prowler`, `stratus`, `aws` | HTTP-API injectors call ofapi; command-line ones run stub tools that reproduce the tool's arguments and output format (so the injector's parser runs for real); checks: status, completion message, findings, vendor calls | `injector_vendors.py` |
+| Catalog / asset collectors | `mitre-atlas`, `nvd-nist-cve`, `openaev-payloads`, `aws-resources` | the collector imports ofapi's small dataset; the platform must hold what it implies and nothing it excludes (revoked technique, CVE without CVSS v3.1, terminated instance) | `catalog_vendors.py` |
+
+`staticfire matrix [recipes...] --all-verdicts --out <dir>` runs any set of them one after the
+other (they share the platform and the fake), saves each JSON report and prints a summary table;
+with no recipe it runs them all (about an hour with every verdict).
+
+Collector recipes first check the platform's clock: collectors judge expectations by their age,
+and a multipass VM's clock falls behind while the host sleeps. A skew over two minutes stops the
+recipe with the command that fixes it (`multipass exec <vm> -- sudo chronyc makestep`).
+
+Adding a component is adding a spec to one of those files: its settings pointing at the fake, the
+vendor answers (or stub) for each verdict, and what must be observed.
 
 `--injector-path` / `--collector-path` test another checkout (a PR branch in a worktree, for
 instance); `--pyoaev ../client-python` runs the component on a local pyoaev.
@@ -132,6 +148,10 @@ Tools: `status`, `list_recipes`, `fire_recipe`, `component_up`, `component_down`
 
 ## Known gaps found with staticfire
 
+Filed: [injectors#534](https://github.com/OpenAEV-Platform/injectors/issues/534) (email implant
+name), [client-python#385](https://github.com/OpenAEV-Platform/client-python/issues/385) (signature
+trace message).
+
 - Email injects can be matched like agent ones: their expectations carry the implant name
   (`parent_process_name` = `<injector type><inject>-agent-<agent>`), and an email carrying it in an
   `X-OpenAEV-*` header, a body URL or an attachment is matched by the mailpit collector. But
@@ -143,13 +163,27 @@ Tools: `status`, `list_recipes`, `fire_recipe`, `component_up`, `component_down`
   `execution_output_structured` as a flat dictionary, while the platform's
   `SignatureOutputProcessor` reads a `targets[]` list and silently skips anything else; and its
   signature-manager payload has no agent/asset target, which the platform drops too.
-- pyoaev 3.261118.0 declares `requires-python >=3.11` but imports `typing.override` (3.12+), so
-  a component installed on 3.11 fails at its first import.
-- `http-query` fails with `'basicAuth'` (a `KeyError`) when an inject omits that optional field;
-  the UI always sends it, an API client may not.
 - Every signature callback leaves a trace reading `Current action: data - Current status: data`:
   pyoaev's `ExecutionDetails.execution_message` (`pyoaev/signatures/models.py`) fills the status
   half from `execution_action` instead of `execution_status`.
+- pyoaev 3.261118.0 declares `requires-python >=3.11` but imports `typing.override` (3.12+), so
+  a component installed on 3.11 fails at its first import.
+- `crowdstrike` and `openaev` collectors fail at startup without `COLLECTOR_NAME`: their
+  settings do not override pyoaev's required `name`, while their READMEs document a default
+  (every other collector has one).
+- `http-query` fails with `'basicAuth'` (a `KeyError`) when an inject omits that optional field;
+  the UI always sends it, an API client may not.
+- The AI request marker signatures (`ai_request_marker`, `ai_target_endpoint`) are defined in the
+  platform but never attached: `AiSignatureUtils.computeAiSignatures` has no caller, so AI
+  expectations only carry `parent_process_name`. The AI collectors work around it by recomputing
+  the marker.
+
+Not testable against a fake without a collector change (hardcoded vendor hosts):
+`microsoft-defender`, `microsoft-defender-o365` (MSAL authority), `microsoft-azure`,
+`microsoft-intune`, `microsoft-sentinel`, `microsoft-entra` (Graph host), `google-workspace`,
+`ovhcloud`, `mitre-attack`, `atomic-red-team`. `scenarios` only verifies releases in dry-run mode,
+against an HTTPS GitHub API. Not covered yet: `nuclei` (its startup imports CVE contracts from
+GitHub into the platform) and `http-query` (tested by hand only).
 
 ## Development
 
