@@ -829,9 +829,9 @@ def connector_test(
         bundles_dir.mkdir(parents=True)
         env["CONNECTOR_SEND_TO_DIRECTORY"] = "true"
         env["CONNECTOR_SEND_TO_DIRECTORY_PATH"] = str(bundles_dir)
-        if spec.proxy:
-            proxy = fakes.proxy_up(fake)
-            env.update(proxy.env([profile.host or ""]))
+        proxy = fakes.proxy_up(fake)
+        # Without the proxy (clients ignoring it), the vendor URL points at ofapi itself
+        env.update(proxy.env([profile.host or ""]) if spec.proxy else proxy.trust_env())
         env.update(spec.env(fake))
         env = {
             **connector_vendors.compose_defaults(connector_dir),

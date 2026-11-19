@@ -161,10 +161,23 @@ class Proxy:
         self.bundle.write_text("\n".join(parts))
         return self.bundle
 
+    def trust_env(self) -> dict[str, str]:
+        """What makes the usual HTTP clients trust the proxy's and ofapi's certificates."""
+        bundle = str(self.bundle)
+        names = (
+            "REQUESTS_CA_BUNDLE",  # requests
+            "SSL_CERT_FILE",  # ssl's default context: urllib, httpx, aiohttp
+            "CURL_CA_BUNDLE",
+            "AWS_CA_BUNDLE",  # botocore
+            "HTTPLIB2_CA_CERTS",  # google-api-python-client
+            "GRPC_DEFAULT_SSL_ROOTS_FILE_PATH",
+            "NODE_EXTRA_CA_CERTS",
+        )
+        return dict.fromkeys(names, bundle)
+
     def env(self, no_proxy: list[str]) -> dict[str, str]:
         """What makes a process send its HTTP(S) through the proxy and trust it."""
         bypass = ",".join(["127.0.0.1", "localhost", *no_proxy])
-        bundle = str(self.bundle)
         return {
             "HTTP_PROXY": self.url,
             "HTTPS_PROXY": self.url,
@@ -172,9 +185,7 @@ class Proxy:
             "https_proxy": self.url,
             "NO_PROXY": bypass,
             "no_proxy": bypass,
-            "REQUESTS_CA_BUNDLE": bundle,
-            "SSL_CERT_FILE": bundle,
-            "CURL_CA_BUNDLE": bundle,
+            **self.trust_env(),
         }
 
 
