@@ -21,5 +21,6 @@ SPEC = ConnectorSpec(
         "relationship:resolves-to",
     },
     calls=["/cuckoo/api/tasks/list", "/cuckoo/api/tasks/summary/"],
+    opens_work=False,  # it sends its bundles without a work
     description="reported sandbox tasks become reports with the sample, network and process data",
 )

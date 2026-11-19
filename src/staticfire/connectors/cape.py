@@ -17,14 +17,15 @@ SPEC = ConnectorSpec(
         "domain-name",
         "process",
         "note",
-        "malware",
+        # a malware family only the first time it is seen (later ones link the existing one)
         "network-traffic",
         "windows-registry-key",
         "relationship:related-to",
         "relationship:resolves-to",
         "relationship:based-on",
     },
-    timeout=90,
+    timeout=300,
     calls=["/cape/apiv2/tasks/list", "/cape/apiv2/tasks/get/report/"],
+    opens_work=False,  # it sends its bundles without a work
     description="reported sandbox tasks become a report with files, network, processes and notes",
 )
