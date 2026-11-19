@@ -28,6 +28,7 @@ from staticfire import (
     logscan,
     ops,
     runner,
+    shims,
     vendors,
 )
 from staticfire.config import Profile
@@ -837,6 +838,7 @@ def connector_test(
         # Without the proxy (clients ignoring it), the vendor URL points at ofapi itself
         env.update(proxy.env([profile.host or ""]) if spec.proxy else proxy.trust_env())
         env.update(spec.env(fake))
+        env.update(shims.env(env.get("PYTHONPATH")))
         env = {
             **connector_vendors.compose_defaults(connector_dir),
             **connector_vendors.schema_placeholders(connector_dir, env),

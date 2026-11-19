@@ -260,7 +260,8 @@ def _connector_requirements(root: Path) -> list[str]:
         requirements += ["-e", str(root)]
     if not requirements:
         raise RunnerError(f"No requirements.txt or pyproject.toml in {root}")
-    return requirements
+    # httplib2 (Google API clients) only goes through HTTP(S)_PROXY with PySocks installed
+    return [*requirements, "pysocks"]
 
 
 def _importable(component: Component, module: str) -> bool:

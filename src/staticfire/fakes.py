@@ -172,6 +172,7 @@ class Proxy:
             "HTTPLIB2_CA_CERTS",  # google-api-python-client
             "GRPC_DEFAULT_SSL_ROOTS_FILE_PATH",
             "NODE_EXTRA_CA_CERTS",
+            "GIT_SSL_CAINFO",
         )
         return dict.fromkeys(names, bundle)
 
