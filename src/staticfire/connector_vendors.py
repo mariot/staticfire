@@ -70,6 +70,9 @@ class ConnectorSpec:
     # Send the connector's HTTP(S) through the proxy (off for clients ignoring proxies, which
     # then need their vendor URL pointed at ofapi in ``env``)
     proxy: bool = True
+    # False for a connector writing through the API without opening works: it is then judged
+    # on what its account created (a design weakness worth noting in the description)
+    opens_work: bool = True
     # Why the connector cannot be exercised offline; the recipe then only reports it
     blocked: str = ""
     timeout: float = 300

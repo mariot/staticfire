@@ -381,6 +381,12 @@ def fire(
         str | None, typer.Option(help="mailpit-collector: header, url, attachment, all or none")
     ] = None,
     as_json: Annotated[bool, typer.Option("--json", help="Full JSON report")] = False,
+    timeout: Annotated[
+        float | None, typer.Option(help="Connector recipes: seconds to wait for the run")
+    ] = None,
+    connector_path: Annotated[
+        str | None, typer.Option(help="Connector recipes: another checkout of the connector")
+    ] = None,
     profile: ProfileOpt = None,
 ):
     """Run an end-to-end recipe; exits 0 on PASS, 1 otherwise."""
@@ -398,6 +404,8 @@ def fire(
         pyoaev=pyoaev,
         verdict=verdict,
         carrier=carrier,
+        timeout=timeout,
+        connector_path=connector_path,
     )
     _print(result.to_dict() if as_json else result.summary())
     raise typer.Exit(0 if result.verdict == "PASS" else 1)

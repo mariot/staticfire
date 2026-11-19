@@ -816,7 +816,8 @@ def connector_test(
         user_id, token = _service_token(profile, cti, f"staticfire-{spec.recipe}")
         env = {
             "OPENCTI_TOKEN": token,
-            "CONNECTOR_NAME": f"staticfire {spec.recipe}",
+            # one name per connector: its specs share its id, a rename would confuse OpenCTI
+            "CONNECTOR_NAME": f"staticfire {connector_dir.name}",
             "CONNECTOR_DURATION_PERIOD": "PT1H",
             "CONNECTOR_RUN_AND_TERMINATE": "false",
             # the setting production should use (pycti warns about its default)
@@ -839,9 +840,11 @@ def connector_test(
         env.update(proxy.env([profile.host or ""]) if spec.proxy else proxy.trust_env())
         env.update(spec.env(fake))
         env.update(shims.env(env.get("PYTHONPATH")))
+        compose = connector_vendors.compose_defaults(connector_dir)
         env = {
-            **connector_vendors.compose_defaults(connector_dir),
-            **connector_vendors.schema_placeholders(connector_dir, env),
+            # a placeholder only where neither the compose file nor the spec gives a value
+            **connector_vendors.schema_placeholders(connector_dir, {**compose, **env}),
+            **compose,
             **env,
         }
         # Every run starts from a blank state (two specs of one connector share its id)
@@ -890,6 +893,10 @@ def connector_test(
                 return None
             return works if time.time() - settled["since"] >= QUIET_SECONDS else None
 
+        if not spec.opens_work:
+            _knowledge_checks(report, cti, spec, user_id, platform_started, bundles_dir, timeout)
+            _vendor_call_checks(report, fake, spec)
+            return report
         finished, works = wait_until(done, timeout or spec.timeout, 10)
         works = works or _connector_works(cti, connector_id, platform_started)
         report.evidence["works"] = works
@@ -918,7 +925,7 @@ def connector_test(
             )
         if spec.family == "internal-export-file" and spec.export:
             files = cti.export_files(entity_type, object_id if scope == "entity" else None)
-            mine = [f for f in files if f"(staticfire {spec.recipe})" in f["name"]]
+            mine = [f for f in files if f"(staticfire {connector_dir.name})" in f["name"]]
             report.evidence["export_files"] = mine[:3]
             report.check(
                 "it produced a non-empty export file",
@@ -934,6 +941,47 @@ def connector_test(
         if not keep:
             runner.stop(run_name)
     return report
+
+
+def _stix_types(changed: list[dict]) -> set[str]:
+    """OpenCTI entity types as STIX ones ("relationship:<type>" for relationships)."""
+    special = {"StixFile": "file", "stix-sighting-relationship": "sighting"}
+    types = set()
+    for item in changed:
+        if item.get("relationship_type"):
+            types |= {"relationship", f"relationship:{item['relationship_type']}"}
+        elif item.get("entity_type"):
+            types.add(special.get(item["entity_type"], item["entity_type"].lower()))
+    return types
+
+
+def _knowledge_checks(report, cti, spec, user_id, platform_started, bundles_dir, timeout) -> None:
+    """For a connector writing through the API without opening works: what its own account
+    created or updated, once nothing changed for a while."""
+    since = datetime.fromtimestamp(platform_started - 5, UTC).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+    settled = {"count": -1, "since": time.time()}
+
+    def quiet() -> list[dict] | None:
+        changed = cti.changed_since(since, creator_id=user_id)
+        if len(changed) != settled["count"]:
+            settled.update(count=len(changed), since=time.time())
+        return changed if changed and time.time() - settled["since"] >= QUIET_SECONDS else None
+
+    _, changed = wait_until(quiet, timeout or spec.timeout, 10)
+    changed = changed or []
+    types = _stix_types(changed) | set(_sent_types(bundles_dir))
+    report.evidence["ingested_types"] = sorted(types)
+    report.check(
+        f"its account created at least {spec.min_elements} element(s) (it opens no work)",
+        len(changed) >= spec.min_elements,
+        len(changed),
+    )
+    if spec.expected_types:
+        report.check(
+            f"it created {sorted(spec.expected_types)}",
+            spec.expected_types <= types,
+            sorted(types),
+        )
 
 
 def _sent_types(bundles_dir: Path) -> list[str]:
