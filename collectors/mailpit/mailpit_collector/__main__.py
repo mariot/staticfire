@@ -2,20 +2,24 @@
 
 It speaks the real collector protocol (pyoaev CollectorDaemon: registration, ping, pending
 agent expectations, expectation results and traces) and answers DETECTION and PREVENTION
-expectations of email injects from what a mailpit server received:
+expectations from what a mailpit server received, matching like an EDR collector does: an
+expectation is matched when its implant name (its ``parent_process_name`` signature, e.g.
+``openaev_email_smtp<inject>-agent-<agent>``) appears in a received message, in one of three
+carriers:
 
-* the recipients come from the expectation's ``target_email`` signatures when the platform
-  attached some, otherwise from the inject content (``to``/``cc``/``bcc``), with its subject;
-* a delivered matching message is a detection (and not a prevention): "Detected" /
-  "Not Prevented";
-* no message after ``COLLECTOR_MAILPIT_GRACE`` seconds counts as blocked: "Not Detected" /
-  "Prevented".
+* ``header``: the value of any message header (e.g. ``X-OpenAEV-Implant``);
+* ``url``: a URL of the text or HTML body;
+* ``attachment``: an attachment's file name or text content.
 
-Expectations of injects that are not emails (no recipient) are left to other collectors.
+A matched message is a detection (and not a prevention): "Detected" / "Not Prevented". The
+carrier is recorded in the result metadata and in the trace name. Unmatched expectations are left
+pending, as an EDR collector leaves them, so expectations meant for other collectors are not
+touched.
 """
 
 from __future__ import annotations
 
+import re
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -24,7 +28,10 @@ from pyoaev.configuration import Configuration
 from pyoaev.daemons import CollectorDaemon
 
 ICON = Path(__file__).parent / "img" / "icon.png"
-RECIPIENT_FIELDS = ("to", "cc", "bcc")
+URL_PATTERN = re.compile(r"https?://[^\s\"'<>]+")
+# Attachments bigger than this are matched on their name only
+MAX_ATTACHMENT_SCAN = 1024 * 1024
+RECENT_MESSAGES = 200
 
 
 def _parse_date(value: str | None) -> datetime | None:
@@ -41,12 +48,12 @@ def _parse_date(value: str | None) -> datetime | None:
     return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
 
 
-def _split(addresses: str | list | None) -> list[str]:
-    if not addresses:
-        return []
-    if isinstance(addresses, list):
-        addresses = ",".join(str(a) for a in addresses)
-    return [a.strip() for a in addresses.replace(";", ",").split(",") if a.strip()]
+def find_carrier(implant: str, carriers: dict[str, list[str]]) -> str | None:
+    """The first carrier (header, url, attachment) one of whose texts contains the implant."""
+    for carrier, texts in carriers.items():
+        if any(implant in text for text in texts):
+            return carrier
+    return None
 
 
 class MailpitCollector(CollectorDaemon):
@@ -57,93 +64,113 @@ class MailpitCollector(CollectorDaemon):
             collector_type="staticfire_mailpit",
         )
         self.mailpit_url = self._configuration.get("mailpit_url").rstrip("/")
-        self.grace = int(self._configuration.get("mailpit_grace") or 120)
-        self._injects: dict[str, dict] = {}
+        self._carriers_by_message: dict[str, dict[str, list[str]]] = {}
 
-    # -- matching data --
+    # -- what a message exposes --
 
-    def _inject_content(self, inject_id: str) -> dict:
-        if inject_id not in self._injects:
-            inject = self.api.http_get(f"/injects/{inject_id}")
-            self._injects[inject_id] = (inject or {}).get("inject_content") or {}
-        return self._injects[inject_id]
-
-    def _criteria(self, expectation: dict) -> tuple[list[str], str | None]:
-        signatures = expectation.get("inject_expectation_signatures") or []
-        recipients = [s["value"] for s in signatures if s.get("type") == "target_email"]
-        content = self._inject_content(expectation["inject_expectation_inject"])
-        if not recipients:
-            for field in RECIPIENT_FIELDS:
-                recipients += _split(content.get(field))
-        return recipients, content.get("subject")
-
-    def _delivered(self, recipient: str, subject: str | None, since: datetime) -> list[dict]:
-        query = f'to:"{recipient}"'
-        if subject:
-            query += ' subject:"' + subject.replace('"', " ") + '"'
-        response = requests.get(
-            f"{self.mailpit_url}/api/v1/search", params={"query": query}, timeout=15
-        )
+    def _get(self, path: str, **params) -> requests.Response:
+        response = requests.get(f"{self.mailpit_url}{path}", params=params or None, timeout=15)
         response.raise_for_status()
-        messages = response.json().get("messages", [])
+        return response
+
+    def _recent_messages(self, since: datetime) -> list[dict]:
+        messages = self._get("/api/v1/messages", limit=RECENT_MESSAGES).json().get("messages", [])
         return [m for m in messages if (_parse_date(m.get("Created")) or since) >= since]
+
+    def _carriers(self, message_id: str) -> dict[str, list[str]]:
+        """Texts of a message per carrier, read once per message."""
+        if message_id not in self._carriers_by_message:
+            message = self._get(f"/api/v1/message/{message_id}").json()
+            headers = self._get(f"/api/v1/message/{message_id}/headers").json()
+            body = f"{message.get('Text') or ''}\n{message.get('HTML') or ''}"
+            attachments = []
+            for attachment in message.get("Attachments") or []:
+                attachments.append(attachment.get("FileName") or "")
+                if (attachment.get("Size") or 0) <= MAX_ATTACHMENT_SCAN:
+                    part = self._get(f"/api/v1/message/{message_id}/part/{attachment['PartID']}")
+                    attachments.append(part.content.decode("utf-8", errors="ignore"))
+            self._carriers_by_message[message_id] = {
+                "header": [value for values in headers.values() for value in values],
+                "url": URL_PATTERN.findall(body),
+                "attachment": attachments,
+            }
+        return self._carriers_by_message[message_id]
 
     # -- answering --
 
-    def _answer(self, expectation: dict, message: dict | None) -> None:
+    def _answer(self, expectation: dict, message: dict, carrier: str) -> None:
         detection = expectation["inject_expectation_type"] == "DETECTION"
-        if message:
-            result, success = ("Detected", True) if detection else ("Not Prevented", False)
-        else:
-            result, success = ("Not Detected", False) if detection else ("Prevented", True)
+        result, success = ("Detected", True) if detection else ("Not Prevented", False)
         collector_id = self._configuration.get("collector_id")
-        update = {"collector_id": collector_id, "result": result, "is_success": success}
-        if message:
-            update["metadata"] = {"alertId": message["ID"]}
-        self.api.inject_expectation.update(expectation["inject_expectation_id"], update)
-        if message:
-            self.api.inject_expectation_trace.bulk_create(
-                payload={
-                    "expectation_traces": [
-                        {
-                            "inject_expectation_trace_expectation": expectation[
-                                "inject_expectation_id"
-                            ],
-                            "inject_expectation_trace_source_id": collector_id,
-                            "inject_expectation_trace_alert_name": message.get("Subject"),
-                            "inject_expectation_trace_alert_link": (
-                                f"{self.mailpit_url}/view/{message['ID']}"
-                            ),
-                            "inject_expectation_trace_date": message.get("Created"),
-                        }
-                    ]
-                }
-            )
+        self.api.inject_expectation.update(
+            expectation["inject_expectation_id"],
+            {
+                "collector_id": collector_id,
+                "result": result,
+                "is_success": success,
+                "metadata": {"alertId": message["ID"], "carrier": carrier},
+            },
+        )
+        self.api.inject_expectation_trace.bulk_create(
+            payload={
+                "expectation_traces": [
+                    {
+                        "inject_expectation_trace_expectation": expectation[
+                            "inject_expectation_id"
+                        ],
+                        "inject_expectation_trace_source_id": collector_id,
+                        "inject_expectation_trace_alert_name": (
+                            f"{message.get('Subject')} (implant in {carrier})"
+                        ),
+                        "inject_expectation_trace_alert_link": (
+                            f"{self.mailpit_url}/view/{message['ID']}"
+                        ),
+                        "inject_expectation_trace_date": message.get("Created"),
+                    }
+                ]
+            }
+        )
         self.logger.info(
             f"Answered {expectation['inject_expectation_type']} expectation "
             f"{expectation['inject_expectation_id']} of inject "
-            f"{expectation['inject_expectation_inject']}: {result}"
+            f"{expectation['inject_expectation_inject']}: {result} (implant in {carrier})"
         )
 
     def _process(self) -> None:
-        expectations = self.api.inject_expectation.expectations_assets_for_source(
-            self._configuration.get("collector_id")
-        )
+        expectations = [
+            e
+            for e in self.api.inject_expectation.expectations_assets_for_source(
+                self._configuration.get("collector_id")
+            )
+            if e.get("inject_expectation_type") in ("DETECTION", "PREVENTION")
+        ]
         self.logger.info(f"{len(expectations)} pending expectations")
+        if not expectations:
+            return
         now = datetime.now(UTC)
-        for expectation in expectations:
-            if expectation.get("inject_expectation_type") not in ("DETECTION", "PREVENTION"):
+        created = [_parse_date(e.get("inject_expectation_created_at")) or now for e in expectations]
+        messages = self._recent_messages(min(created) - timedelta(minutes=1))
+        for expectation, created_at in zip(expectations, created, strict=True):
+            implants = [
+                s["value"]
+                for s in expectation.get("inject_expectation_signatures") or []
+                if s.get("type") == "parent_process_name"
+            ]
+            match = self._match(implants, messages, created_at - timedelta(minutes=1))
+            if match:
+                self._answer(expectation, *match)
+
+    def _match(
+        self, implants: list[str], messages: list[dict], since: datetime
+    ) -> tuple[dict, str] | None:
+        for message in messages:
+            if (_parse_date(message.get("Created")) or since) < since:
                 continue
-            recipients, subject = self._criteria(expectation)
-            if not recipients:
-                continue
-            created = _parse_date(expectation.get("inject_expectation_created_at")) or now
-            since = created - timedelta(minutes=1)
-            messages = [m for r in recipients for m in self._delivered(r, subject, since)]
-            if messages:
-                self._answer(expectation, messages[0])
-            elif (now - created).total_seconds() > self.grace:
-                self._answer(expectation, None)
+            carriers = self._carriers(message["ID"])
+            for implant in implants:
+                if carrier := find_carrier(implant, carriers):
+                    return message, carrier
+        return None
 
 
 def main() -> None:
@@ -175,12 +202,6 @@ def main() -> None:
             },
             "collector_icon_filepath": {"data": str(ICON)},
             "mailpit_url": {"env": "MAILPIT_URL", "file_path": ["mailpit", "url"]},
-            "mailpit_grace": {
-                "env": "COLLECTOR_MAILPIT_GRACE",
-                "file_path": ["mailpit", "grace"],
-                "is_number": True,
-                "default": 120,
-            },
         },
     )
     MailpitCollector(configuration).start()

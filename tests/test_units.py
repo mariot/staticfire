@@ -101,10 +101,16 @@ def test_collector_parses_openaev_nanosecond_dates():
     assert parsed.microsecond == 606941
 
 
-def test_collector_splits_recipient_lists():
+def test_collector_finds_the_carrier_holding_the_implant():
     module = _collector_module()
-    assert module._split("a@x.y, b@x.y;c@x.y") == ["a@x.y", "b@x.y", "c@x.y"]
-    assert module._split(None) == []
+    implant = "openaev_email_smtp1f05-agent-8b58"
+    carriers = {
+        "header": ["staticfire@openaev.test", "X"],
+        "url": [f"https://staticfire.test/landing?ref={implant}"],
+        "attachment": [f"{implant}.txt"],
+    }
+    assert module.find_carrier(implant, carriers) == "url"
+    assert module.find_carrier("openaev_email_smtp9999-agent-0000", carriers) is None
 
 
 def test_form_value_takes_the_first_default_of_single_value_fields():

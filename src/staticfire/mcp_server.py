@@ -51,12 +51,15 @@ def fire_recipe(
     collector_path: str | None = None,
     pyoaev: str | None = None,
     verdict: str | None = None,
+    carrier: str | None = None,
     profile: str | None = None,
 ) -> dict:
     """Run an end-to-end recipe and return its report (verdict PASS/FAIL/ERROR, named checks,
     links and evidence). Paths default to sibling checkouts of the injectors/collectors repos;
     pass a path to test another checkout or branch. pyoaev: local client-python checkout.
-    verdict (cortex-xdr): what the scripted XDR reports, prevented, detected or none."""
+    verdict (cortex-xdr): what the scripted XDR reports, prevented, detected or none.
+    carrier (mailpit-collector): where the email carries its implant name, header, url,
+    attachment, all, or none (negative case: nothing must be answered)."""
     fn = recipes.RECIPES[recipe]
     options = {
         "keep": keep,
@@ -64,6 +67,7 @@ def fire_recipe(
         "collector_path": collector_path,
         "pyoaev": pyoaev,
         "verdict": verdict,
+        "carrier": carrier,
     }
     accepted = inspect.signature(fn).parameters
     return fn(_p(profile), **{k: v for k, v in options.items() if k in accepted and v}).to_dict()

@@ -367,6 +367,9 @@ def fire(
     verdict: Annotated[
         str | None, typer.Option(help="cortex-xdr: prevented, detected or none")
     ] = None,
+    carrier: Annotated[
+        str | None, typer.Option(help="mailpit-collector: header, url, attachment, all or none")
+    ] = None,
     as_json: Annotated[bool, typer.Option("--json", help="Full JSON report")] = False,
     profile: ProfileOpt = None,
 ):
@@ -383,6 +386,7 @@ def fire(
         "collector_path": collector_path,
         "pyoaev": pyoaev,
         "verdict": verdict,
+        "carrier": carrier,
     }
     accepted = inspect.signature(fn).parameters
     result = fn(_profile(profile), **{k: v for k, v in options.items() if k in accepted and v})

@@ -124,27 +124,148 @@ def email_smtp(
     return report
 
 
+CARRIERS = ("header", "url", "attachment")
+
+
+def _place_implants(api, content: dict, implants: list[str], carrier: str) -> list[dict]:
+    """Write the implant names into the email carrier; returns the documents to attach."""
+    if carrier == "header":
+        content["custom_headers"] = f"X-OpenAEV-Implant: {', '.join(implants)}"
+    elif carrier == "url":
+        links = "\n".join(f"https://staticfire.test/landing?ref={i}" for i in implants)
+        content["body"] = f"{content['body']}\n{links}"
+    elif carrier == "attachment":
+        document = api.upload_document(
+            f"{implants[0]}.txt",
+            ("staticfire attachment\n" + "\n".join(implants) + "\n").encode(),
+            "Implant carrier uploaded by staticfire",
+        )
+        return [{"document_id": document["document_id"], "document_attached": True}]
+    elif carrier != "none":
+        raise ValueError(f"Unknown carrier {carrier}, known: {CARRIERS} or none")
+    return []
+
+
+def _carried(mail: dict, implants: list[str], carrier: str) -> bool:
+    if carrier == "header":
+        values = mail["custom_headers"].get("X-Openaev-Implant") or []
+        return all(any(i in v for v in values) for i in implants)
+    if carrier == "url":
+        return all(f"ref={i}" in (mail["text"] or "") for i in implants)
+    return any(a["file_name"] == f"{implants[0]}.txt" for a in mail["attachments"])
+
+
+def _carried_anywhere(mail: dict, implants: list[str]) -> bool:
+    texts = [mail["text"] or "", mail["html"] or ""]
+    texts += [v for values in mail["custom_headers"].values() for v in values]
+    texts += [a["file_name"] or "" for a in mail["attachments"]]
+    return any(i in t for i in implants for t in texts)
+
+
+def _fire_carrier(
+    report: Report,
+    profile: Profile,
+    carrier: str,
+    contract_id: str,
+    injector_type: str,
+    endpoint: dict,
+    collector_id: str,
+    timeout: float,
+) -> None:
+    api = ops.client(profile)
+    token = uuid.uuid4().hex[:10]
+    content = _email_content(profile, token)
+    content["expectations"] = ops.expectation_content(ops.TECHNICAL_EXPECTATIONS)
+    base = {
+        "inject_title": f"staticfire mailpit-collector {carrier} {token}",
+        "inject_injector_contract": contract_id,
+        "inject_assets": [endpoint["asset_id"]],
+    }
+    inject_id = api.create_atomic_testing({**base, "inject_content": content})["inject_id"]
+    # The name OpenAEV gives the inject's implant on each agent: its parent_process_name signature
+    implants = [
+        f"{injector_type}{inject_id}-agent-{a['agent_id']}"
+        for a in endpoint["agents"]
+        if a["active"]
+    ]
+    documents = _place_implants(api, content, implants, carrier)
+    api.update_atomic_testing(
+        inject_id, {**base, "inject_content": content, "inject_documents": documents}
+    )
+    result = ops.launch_and_wait(profile, inject_id, [endpoint["asset_id"]])
+    report.refs[f"{carrier}_inject"] = result["link"]
+    report.check(f"[{carrier}] inject EXECUTED", result["status"] == "EXECUTED", result["status"])
+    box = ops.mailpit(profile)
+    messages = box.wait_for(f'to:"{content["to"]}"', timeout=60)
+    if not report.check(f"[{carrier}] email delivered", messages, f"nothing for {content['to']}"):
+        return
+    mail = box.describe(messages[0]["ID"])
+    report.refs[f"{carrier}_message"] = f"{profile.mailpit_url}/view/{mail['id']}"
+    if carrier == "none":
+        # Negative case: no implant anywhere, the collector must leave the expectations pending
+        report.check("[none] email carries no implant", not _carried_anywhere(mail, implants), mail)
+        wait_until(lambda: False, 45, 5)  # several collector cycles
+        expectations = ops.expectations_of_target(api, inject_id, endpoint["asset_id"])
+        answers = [
+            r
+            for e in expectations
+            for r in e["results"]
+            if r["source_id"] == collector_id and r["result"]
+        ]
+        report.check("[none] collector leaves the expectations unanswered", not answers, answers)
+        return
+    report.check(f"[{carrier}] email carries the implant", _carried(mail, implants, carrier), mail)
+    answered, expectations = ops.wait_expectations(
+        profile, inject_id, endpoint["asset_id"], collector_id, timeout=timeout
+    )
+    report.evidence[f"{carrier}_expectations"] = expectations
+    report.check(f"[{carrier}] collector answers every expectation in time", answered)
+    for kind, expected in (("DETECTION", "Detected"), ("PREVENTION", "Not Prevented")):
+        mine = [
+            r
+            for e in expectations
+            if e["type"] == kind
+            for r in e["results"]
+            # OpenAEV pre-creates an empty result slot per collector it expects an answer from
+            if r["source_id"] == collector_id and r["result"]
+        ]
+        report.check(
+            f"[{carrier}] {kind} answered '{expected}', matched in the {carrier}",
+            bool(mine)
+            and mine[0]["result"] == expected
+            and (mine[0]["metadata"] or {}).get("carrier") == carrier,
+            mine,
+        )
+
+
 def mailpit_collector(
     profile: Profile,
     injector_path: str | None = None,
     collector_path: str | None = None,
     asset_id: str | None = None,
+    carrier: str = "all",
     keep: bool = False,
     timeout: float = 180,
 ) -> Report:
-    """Collector test: an email inject with agent expectations, answered by a collector.
+    """Collector test: email injects carrying their implant name, answered by a collector.
 
-    The collector under test defaults to staticfire's mailpit collector; it must be one that
-    answers email inject expectations from mailpit (pass collector_path to test another).
+    For each carrier (header, url, attachment, or all; none for the negative case: no implant,
+    nothing must be answered), an email inject targets an agent
+    endpoint with DETECTION/PREVENTION expectations; its implant name (the expectations'
+    parent_process_name) is written in that carrier of the email. The collector under test
+    (staticfire's mailpit collector by default) must find it and answer Detected / Not
+    Prevented. email-smtp cannot place the implant itself yet: the recipe edits the inject.
     """
-    report = Report("mailpit-collector")
+    carriers = CARRIERS if carrier == "all" else (carrier,)
+    report = Report(f"mailpit-collector ({', '.join(carriers)})")
     injector = checkout("injectors", "email-smtp", injector_path)
     collector = collector_path or str(MAILPIT_COLLECTOR)
     runs = ["injector-email-smtp", f"collector-{Path(collector).name}"]
     try:
         endpoint = ops.agent_endpoint(profile, asset_id)
         report.refs["endpoint"] = f"{endpoint['name']} ({endpoint['asset_id']})"
-        if not _start(report, profile, injector, "injector"):
+        injector_up = _start(report, profile, injector, "injector")
+        if not injector_up:
             return report
         collector_up = _start(
             report,
@@ -156,48 +277,16 @@ def mailpit_collector(
         )
         if not collector_up:
             return report
-        collector_id = collector_up["component"]["id"]
-        token = uuid.uuid4().hex[:10]
-        content = _email_content(profile, token)
-        result = ops.run_inject(
-            profile,
-            ops.injector_contracts(profile, ops.resolve_injector(profile, injector))[0][
-                "contract_id"
-            ],
-            content,
-            assets=[endpoint["asset_id"]],
-            expectations=list(ops.TECHNICAL_EXPECTATIONS),
-            title=f"staticfire mailpit-collector {token}",
-        )
-        report.refs["inject_id"] = result["inject_id"]
-        report.refs["inject"] = result["link"]
-        report.check("inject status EXECUTED", result["status"] == "EXECUTED", result["status"])
-        _check_delivery(report, profile, content, token)
-        answered, expectations = ops.wait_expectations(
-            profile, result["inject_id"], endpoint["asset_id"], collector_id, timeout=timeout
-        )
-        report.evidence["expectations"] = expectations
-        report.check("collector answers every expectation in time", answered, expectations)
-        by_type = {e["type"]: e for e in expectations}
-        for kind, expected in (("DETECTION", "Detected"), ("PREVENTION", "Not Prevented")):
-            mine = [
-                r
-                for r in (by_type.get(kind) or {}).get("results", [])
-                if r["source_id"] == collector_id and r["result"]
-            ]
-            report.check(
-                f"{kind} answered '{expected}' by the collector",
-                bool(mine) and mine[0]["result"] == expected,
-                mine,
-            )
-        detection = by_type.get("DETECTION")
-        if detection and detection.get("id"):
-            traces = ops.client(profile).expectation_traces(detection["id"], collector_id)
-            report.evidence["detection_traces"] = traces
-            report.check(
-                "detection trace links the delivered message",
-                any(token in (t.get("inject_expectation_trace_alert_name") or "") for t in traces),
-                traces,
+        for name in carriers:
+            _fire_carrier(
+                report,
+                profile,
+                name,
+                injector_up["contracts"][0]["contract_id"],
+                injector_up["entity"]["type"],
+                endpoint,
+                collector_up["component"]["id"],
+                timeout,
             )
     except Exception as err:
         report.error = f"{type(err).__name__}: {err}"
@@ -368,8 +457,10 @@ RECIPES: dict[str, Callable[..., Report]] = {
 DESCRIPTIONS = {
     "email-smtp": "Injector test: craft an email through the email-smtp injector, check that "
     "mailpit received it with the right sender, recipients, subject, body and header.",
-    "mailpit-collector": "Collector test: an email inject with DETECTION/PREVENTION expectations "
-    "on an agent endpoint, answered by the mailpit collector (Detected / Not Prevented).",
+    "mailpit-collector": "Collector test: email injects with DETECTION/PREVENTION expectations "
+    "on an agent endpoint, their implant name written in a header, a body URL or an attachment "
+    "(option carrier: header, url, attachment, all, or none for the negative case); the mailpit "
+    "collector must find it and answer Detected / Not Prevented.",
     "cortex-xdr": "Collector test: the agent runs a marker command, a scripted Cortex XDR "
     "(ofapi) reports alerts on that implant, the palo-alto-cortex-xdr collector must answer "
     "OpenAEV. Option verdict: prevented (default), detected or none.",

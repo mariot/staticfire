@@ -335,15 +335,23 @@ def run_inject(
         }
     )
     inject_id = created["inject_id"]
-    result: dict[str, Any] = {
-        "inject_id": inject_id,
-        "link": ui_link(profile, "atomic_testings", inject_id),
-    }
     if not launch:
-        result["status"] = (created.get("inject_status") or {}).get("status_name")
-        return result
+        return {
+            "inject_id": inject_id,
+            "link": ui_link(profile, "atomic_testings", inject_id),
+            "status": (created.get("inject_status") or {}).get("status_name"),
+        }
+    return launch_and_wait(profile, inject_id, assets, timeout)
+
+
+def launch_and_wait(
+    profile: Profile, inject_id: str, assets: list[str] | None = None, timeout: float = 180
+) -> dict:
+    """Launch an existing atomic testing and report it once its execution ended."""
+    api = client(profile)
     api.launch_atomic_testing(inject_id)
-    finished, inject_status = wait_until(lambda: _terminal_status(api, inject_id), timeout, 3)
+    finished, _ = wait_until(lambda: _terminal_status(api, inject_id), timeout, 3)
+    result: dict[str, Any] = {"link": ui_link(profile, "atomic_testings", inject_id)}
     result.update(inject_report(profile, inject_id, assets or []))
     result["finished"] = finished
     return result

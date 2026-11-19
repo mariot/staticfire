@@ -6,6 +6,7 @@ assert on any field without this module having to model it.
 
 from __future__ import annotations
 
+import json
 import time
 from collections.abc import Callable
 from typing import Any
@@ -104,6 +105,26 @@ class OpenAEV:
     def endpoint(self, endpoint_id: str) -> dict:
         return self.get(f"/api/endpoints/{endpoint_id}")
 
+    # -- documents --
+
+    def upload_document(self, file_name: str, content: bytes, description: str = "") -> dict:
+        """Upload a document (inject attachment); its name is the file name."""
+        self.http.cookies.clear()
+        response = self.http.post(
+            "/api/documents",
+            files={
+                "input": (
+                    None,
+                    json.dumps({"document_description": description}),
+                    "application/json",
+                ),
+                "file": (file_name, content, "application/octet-stream"),
+            },
+        )
+        if response.status_code >= 400:
+            raise OpenAEVError(response)
+        return response.json()
+
     # -- atomic testings --
 
     def create_atomic_testing(self, payload: dict) -> dict:
@@ -111,6 +132,9 @@ class OpenAEV:
 
     def atomic_testing(self, inject_id: str) -> dict:
         return self.get(f"/api/atomic-testings/{inject_id}")
+
+    def update_atomic_testing(self, inject_id: str, payload: dict) -> dict:
+        return self.put(f"/api/atomic-testings/{inject_id}", payload)
 
     def launch_atomic_testing(self, inject_id: str) -> dict:
         return self.post(f"/api/atomic-testings/{inject_id}/launch")

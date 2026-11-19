@@ -20,6 +20,17 @@ class Mailpit:
         response = self.http.get("/api/v1/search", params={"query": query, "limit": limit})
         return response.raise_for_status().json().get("messages", [])
 
+    def messages(self, limit: int = 100) -> list[dict]:
+        """Latest message summaries, newest first."""
+        response = self.http.get("/api/v1/messages", params={"limit": limit})
+        return response.raise_for_status().json().get("messages", [])
+
+    def part(self, message_id: str, part_id: str) -> bytes:
+        """Raw content of a message part (an attachment)."""
+        return (
+            self.http.get(f"/api/v1/message/{message_id}/part/{part_id}").raise_for_status().content
+        )
+
     def message(self, message_id: str) -> dict:
         return self.http.get(f"/api/v1/message/{message_id}").raise_for_status().json()
 
@@ -64,6 +75,7 @@ class Mailpit:
                     "file_name": a.get("FileName"),
                     "content_type": a.get("ContentType"),
                     "size": a.get("Size"),
+                    "part_id": a.get("PartID"),
                 }
                 for a in msg.get("Attachments") or []
             ],

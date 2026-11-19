@@ -55,7 +55,7 @@ recipe started it.
 | Recipe | What is fired | What is checked |
 |---|---|---|
 | `email-smtp` | `injectors/email-smtp` sends a crafted email through mailpit | inject `EXECUTED`, injector `COMPLETE` trace, message delivered with the sender, To/Cc, subject, body and `X-OpenAEV-*` header of the inject |
-| `mailpit-collector` | an email inject targeting an agent endpoint with DETECTION/PREVENTION expectations, answered by `collectors/mailpit` (this repo) | the collector registers, answers `Detected` / `Not Prevented`, and its trace links the delivered message |
+| `mailpit-collector` | email injects targeting an agent endpoint with DETECTION/PREVENTION expectations, their implant name written in an `X-OpenAEV-Implant` header, a body URL or an attachment (`--carrier header\|url\|attachment\|all`, `none` for the negative case); `collectors/mailpit` (this repo) plays the email security platform | per carrier: the email carries the implant, the collector answers `Detected` / `Not Prevented` and records the carrier it matched; with `none` it answers nothing |
 | `cortex-xdr` | the agent runs a marker command; ofapi plays Cortex XDR and reports alerts on that implant; `collectors/palo-alto-cortex-xdr` runs against both | `--verdict prevented`: `Detected` + `Prevented`; `detected`: `Detected`, prevention left pending; `none`: nothing answered. The collector must have queried the XDR alerts API |
 
 `--injector-path` / `--collector-path` test another checkout (a PR branch in a worktree, for
@@ -132,13 +132,17 @@ Tools: `status`, `list_recipes`, `fire_recipe`, `component_up`, `component_down`
 
 ## Known gaps found with staticfire
 
-- `email-smtp` builds email signatures (`source_email`, `target_email`, URL and attachment hashes,
-  custom headers) but they never reach the expectations: they are sent in
+- Email injects can be matched like agent ones: their expectations carry the implant name
+  (`parent_process_name` = `<injector type><inject>-agent-<agent>`), and an email carrying it in an
+  `X-OpenAEV-*` header, a body URL or an attachment is matched by the mailpit collector. But
+  `email-smtp` never writes it (an inject author cannot either: no content variable gives the
+  inject or agent id), so the recipe edits the inject; and `microsoft-defender-o365` reads neither
+  headers (`custom_header` is hardcoded to `""`) nor the implant in URLs or attachments.
+- The email signatures `email-smtp` builds (`source_email`, `target_email`, URL and attachment
+  hashes, custom headers) never reach the expectations: they are sent in
   `execution_output_structured` as a flat dictionary, while the platform's
   `SignatureOutputProcessor` reads a `targets[]` list and silently skips anything else; and its
-  signature-manager payload has no agent/asset target, which the platform drops too. An email
-  security collector such as `microsoft-defender-o365` therefore cannot match on them. The mailpit
-  collector falls back to the inject content (recipients and subject) for that reason.
+  signature-manager payload has no agent/asset target, which the platform drops too.
 - pyoaev 3.261118.0 declares `requires-python >=3.11` but imports `typing.override` (3.12+), so
   a component installed on 3.11 fails at its first import.
 - `http-query` fails with `'basicAuth'` (a `KeyError`) when an inject omits that optional field;
