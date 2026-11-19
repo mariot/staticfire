@@ -24,6 +24,8 @@ class Report:
     # Raw material backing the checks: execution traces, the delivered message, log excerpts...
     evidence: dict[str, Any] = field(default_factory=dict)
     error: str | None = None
+    # Why the run could not happen at all (a connector that cannot run offline...)
+    skipped: str | None = None
 
     def check(self, name: str, ok: bool, detail: Any = None) -> bool:
         self.checks.append(Check(name, bool(ok), detail))
@@ -33,6 +35,8 @@ class Report:
     def verdict(self) -> str:
         if self.error:
             return "ERROR"
+        if self.skipped:
+            return "SKIP"
         return "PASS" if self.checks and all(c.ok for c in self.checks) else "FAIL"
 
     def to_dict(self) -> dict:
@@ -41,6 +45,7 @@ class Report:
             "verdict": self.verdict,
             "duration_s": round(time.time() - self.started_at, 1),
             "error": self.error,
+            "skipped": self.skipped,
             "checks": [{"name": c.name, "ok": c.ok, "detail": c.detail} for c in self.checks],
             "refs": self.refs,
             "evidence": self.evidence,
@@ -50,6 +55,8 @@ class Report:
         lines = [f"{self.recipe}: {self.verdict} ({round(time.time() - self.started_at, 1)}s)"]
         if self.error:
             lines.append(f"  error: {self.error}")
+        if self.skipped:
+            lines.append(f"  skipped: {self.skipped}")
         for c in self.checks:
             mark = "ok  " if c.ok else "FAIL"
             detail = f" - {c.detail}" if c.detail not in (None, "") and not c.ok else ""

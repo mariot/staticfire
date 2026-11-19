@@ -21,6 +21,10 @@ OFAPI_RUN = "fake-ofapi"
 OFAPI_PORT = int(os.environ.get("STATICFIRE_OFAPI_PORT", "8443"))
 OFAPI_HTTP_PORT = int(os.environ.get("STATICFIRE_OFAPI_HTTP_PORT", "8000"))
 LAUNCHER = Path(__file__).with_name("ofapi_dual.py")
+PROXY_RUN = "fake-proxy"
+PROXY_PORT = int(os.environ.get("STATICFIRE_PROXY_PORT", "8899"))
+PROXY_ADDON = Path(__file__).with_name("proxy_addon.py")
+PROXY_DIR = STATE_DIR / "mitmproxy"
 TLS_DIR = STATE_DIR / "tls"
 
 
@@ -83,8 +87,17 @@ class Ofapi:
         except httpx.HTTPError:
             return False
 
-    def reset(self) -> None:
-        self.http.post("/_control/reset").raise_for_status()
+    def reset(self, prefix: str = "") -> None:
+        """Forget rules and journal (only those under ``prefix`` when given: tests can share)."""
+        params = {"prefix": prefix} if prefix else None
+        self.http.post("/_control/reset", params=params).raise_for_status()
+
+    def reload(self) -> list[str]:
+        """Load the vendor modules added or changed since ofapi started."""
+        return self.http.post("/_control/reload").raise_for_status().json()["reloaded"]
+
+    def hosts(self) -> dict[str, str]:
+        return self.http.get("/_control/hosts").raise_for_status().json()
 
     def rule(self, path: str, responses: list[dict], then: str = "last", method=None) -> dict:
         body = {"path": path, "responses": responses, "then": then}
@@ -122,3 +135,76 @@ def ofapi_up(path: str | None = None, port: int = OFAPI_PORT, timeout: float = 6
         raise RuntimeError(f"ofapi did not start: {runner.tail(OFAPI_RUN, 30)}")
     fake.started = True
     return fake
+
+
+class Proxy:
+    """The TLS-intercepting proxy in front of ofapi (see proxy_addon.py)."""
+
+    def __init__(self, port: int = PROXY_PORT):
+        self.url = f"http://127.0.0.1:{port}"
+        self.ca = PROXY_DIR / "mitmproxy-ca-cert.pem"
+        self.bundle = TLS_DIR / "proxy-bundle.pem"
+
+    def alive(self) -> bool:
+        try:
+            with httpx.Client(proxy=self.url, timeout=5) as client:
+                return client.get("http://ofapi.staticfire/_control/rules").status_code == 200
+        except httpx.HTTPError:
+            return False
+
+    def write_bundle(self) -> Path:
+        """Public CAs, the proxy's CA and ofapi's own certificate, for the code under test."""
+        import certifi
+
+        cert, _ = tls_files()
+        parts = [Path(certifi.where()).read_text(), self.ca.read_text(), cert.read_text()]
+        self.bundle.write_text("\n".join(parts))
+        return self.bundle
+
+    def env(self, no_proxy: list[str]) -> dict[str, str]:
+        """What makes a process send its HTTP(S) through the proxy and trust it."""
+        bypass = ",".join(["127.0.0.1", "localhost", *no_proxy])
+        bundle = str(self.bundle)
+        return {
+            "HTTP_PROXY": self.url,
+            "HTTPS_PROXY": self.url,
+            "http_proxy": self.url,
+            "https_proxy": self.url,
+            "NO_PROXY": bypass,
+            "no_proxy": bypass,
+            "REQUESTS_CA_BUNDLE": bundle,
+            "SSL_CERT_FILE": bundle,
+            "CURL_CA_BUNDLE": bundle,
+        }
+
+
+def proxy_up(fake: Ofapi, port: int = PROXY_PORT, timeout: float = 60) -> Proxy:
+    """Reuse a running proxy on the port, or start one (mitmdump through uvx)."""
+    proxy = Proxy(port)
+    if proxy.alive():
+        proxy.write_bundle()
+        return proxy
+    PROXY_DIR.mkdir(parents=True, exist_ok=True)
+    runner.stop(PROXY_RUN)
+    runner.spawn(
+        PROXY_RUN,
+        [
+            "uvx", "--from", "mitmproxy", "mitmdump",
+            "--listen-host", "127.0.0.1", "--listen-port", str(port),
+            "--set", f"confdir={PROXY_DIR}",
+            # Never contact the real host: the request goes to ofapi
+            "--set", "connection_strategy=lazy",
+            "--set", "upstream_cert=false",
+            "--set", "flow_detail=0",
+            "-s", str(PROXY_ADDON),
+        ],
+        cwd=str(PROXY_DIR),
+        env={"STATICFIRE_OFAPI_HTTP": fake.http_base},
+        kind="fake",
+        name="proxy",
+    )  # fmt: skip
+    started, _ = wait_until(proxy.alive, timeout, 1)
+    if not started:
+        raise RuntimeError(f"the proxy did not start: {runner.tail(PROXY_RUN, 30)}")
+    proxy.write_bundle()
+    return proxy

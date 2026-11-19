@@ -84,12 +84,15 @@ def summarise(entries: list[tuple[str, str]], limit: int = 15) -> dict:
     }
 
 
-def component_logs_since(started_at: float) -> dict[str, dict]:
-    """Every component log written since ``started_at`` (a run restarted many times has several)."""
+def component_logs_since(started_at: float, runs: list[str] | None = None) -> dict[str, dict]:
+    """Every component log written since ``started_at`` (a run restarted many times has several),
+    of the given ``runs`` only when named."""
     reviews = {}
     if not runner.RUNS_DIR.exists():
         return reviews
     for run_dir in sorted(runner.RUNS_DIR.iterdir()):
+        if runs is not None and run_dir.name not in runs:
+            continue
         logs = [p for p in sorted(run_dir.glob("*.log")) if p.stat().st_mtime + 1 >= started_at]
         if not logs:
             continue
@@ -157,10 +160,14 @@ def platform_log_since(
 
 
 def review(
-    profile: Profile, started_at: float, skew: float = 0.0, platform: str = "openaev"
+    profile: Profile,
+    started_at: float,
+    skew: float = 0.0,
+    platform: str = "openaev",
+    runs: list[str] | None = None,
 ) -> dict:
     return {
-        "components": component_logs_since(started_at),
+        "components": component_logs_since(started_at, runs),
         "platform": platform_log_since(profile, started_at, skew, platform),
     }
 

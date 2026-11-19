@@ -11,6 +11,7 @@ import inspect
 import json
 import os
 import re
+import shutil
 import time
 import uuid
 from collections.abc import Callable
@@ -31,6 +32,7 @@ from staticfire import (
 )
 from staticfire.config import Profile
 from staticfire.openaev import wait_until
+from staticfire.opencti import OpenCTI
 from staticfire.report import Report
 
 STATICFIRE_ROOT = Path(__file__).resolve().parents[2]
@@ -751,6 +753,34 @@ def _connector_works(cti, connector_id: str, since: float) -> list[dict]:
     return works
 
 
+def _service_token(profile: Profile, cti, name: str) -> tuple[str, str]:
+    """(user id, token) of the connector's own service account, reusing a stored token."""
+    store = config.STATE_DIR / "opencti-users.json"
+    tokens = json.loads(store.read_text()) if store.exists() else {}
+    key = f"{profile.opencti_url}|{name}"
+    if known := tokens.get(key):
+        try:
+            if OpenCTI(profile.opencti_url, known["token"]).graphql("{ me { id } }")["me"]:
+                return known["id"], known["token"]
+        except Exception:
+            pass
+    user_id, token = cti.service_user(name)
+    tokens[key] = {"id": user_id, "token": token}
+    store.parent.mkdir(parents=True, exist_ok=True)
+    store.write_text(json.dumps(tokens, indent=2))
+    store.chmod(0o600)
+    return user_id, token
+
+
+def _enrichment_target(cti, enrich) -> str:
+    if callable(enrich):
+        return enrich(cti)
+    kind, value = enrich
+    if kind == "StixFile":
+        return cti.create_file_observable(value)["id"]
+    return cti.create_observable(kind, value)["id"]
+
+
 def connector_test(
     profile: Profile,
     spec_name: str,
@@ -758,42 +788,86 @@ def connector_test(
     keep: bool = False,
     timeout: float | None = None,
 ) -> Report:
-    """OpenCTI connector test: run it against ofapi, judge its works and what they touched."""
+    """OpenCTI connector test: run it against ofapi (through the proxy), drive it as its family
+    needs, judge its works and what its service account created."""
     spec = connector_vendors.SPECS[spec_name]
     report = Report(spec.recipe)
-    family, name = spec.connector.split("/", 1)
+    if spec.blocked:
+        report.skipped = spec.blocked
+        return report
     connector_dir = Path(connector_path or checkout("connectors", spec.connector))
     run_name = f"connector-{connector_dir.name}"
-    fake = None
     try:
         profile = _cti_profile(profile)
         cti = ops.cti_client(profile)
         report.refs["opencti"] = profile.opencti_url
+        # ofapi and the proxy are shared by concurrent tests: started once, never stopped here
         fake = fakes.ofapi_up()
-        fake.reset()
+        report.refs["ofapi_reloaded"] = fake.reload()
+        for prefix in {"/" + c.strip("/").split("/")[0] for c in spec.calls}:
+            fake.reset(prefix)
         for rule in spec.rules(fake):
             fake.rule(rule.path, [rule.response()], method=rule.method)
+        user_id, token = _service_token(profile, cti, f"staticfire-{spec.recipe}")
         env = {
+            "OPENCTI_TOKEN": token,
             "CONNECTOR_NAME": f"staticfire {spec.recipe}",
             "CONNECTOR_DURATION_PERIOD": "PT1H",
-            **spec.env(fake),
+            "CONNECTOR_RUN_AND_TERMINATE": "false",
+            # the setting production should use (pycti warns about its default)
+            "OPENCTI_TLS_REJECT_UNAUTHORIZED": "true",
         }
-        env = {**connector_vendors.schema_placeholders(connector_dir, env), **env}
+        if spec.family == "internal-enrichment":
+            env["CONNECTOR_AUTO"] = "false"
+        if spec.family == "stream":
+            env["CONNECTOR_LIVE_STREAM_ID"] = cti.live_stream()
+            env["CONNECTOR_LIVE_STREAM_LISTEN_DELETE"] = "true"
+            env["CONNECTOR_LIVE_STREAM_NO_DEPENDENCIES"] = "true"
+        # pycti also writes every bundle it sends here: what the connector produced
+        bundles_dir = runner.RUNS_DIR / run_name / "bundles"
+        shutil.rmtree(bundles_dir, ignore_errors=True)
+        bundles_dir.mkdir(parents=True)
+        env["CONNECTOR_SEND_TO_DIRECTORY"] = "true"
+        env["CONNECTOR_SEND_TO_DIRECTORY_PATH"] = str(bundles_dir)
+        if spec.proxy:
+            proxy = fakes.proxy_up(fake)
+            env.update(proxy.env([profile.host or ""]))
+        env.update(spec.env(fake))
+        env = {
+            **connector_vendors.compose_defaults(connector_dir),
+            **connector_vendors.schema_placeholders(connector_dir, env),
+            **env,
+        }
         started = time.time()
         up = _start(report, profile, str(connector_dir), "connector", kind="connector", env=env)
         if not up:
             return report
         connector_id = up["component"]["id"]
-        if spec.enrich:
-            kind, value = spec.enrich
-            observable = cti.create_observable(kind, value)
-            report.refs["observable"] = observable["id"]
-            cti.ask_enrichment(observable["id"], connector_id)
+        if spec.family == "stream":
+            _stream_checks(report, cti, fake, spec, timeout)
+            return report
+        if spec.family == "internal-enrichment" and spec.enrich:
+            target = _enrichment_target(cti, spec.enrich)
+            report.refs["enriched"] = target
+            cti.ask_enrichment(target, connector_id)
+        elif spec.family == "internal-import-file" and spec.import_file:
+            file_name, source, mime = spec.import_file
+            content = fake.http.get(source).raise_for_status().content
+            uploaded = cti.upload_import(file_name, content, mime)
+            report.refs["imported_file"] = uploaded["id"]
+            cti.ask_import(uploaded["id"], connector_id)
+        elif spec.family == "internal-export-file" and spec.export:
+            mime, scope = spec.export
+            object_id, entity_type = (spec.export_object or _default_export_object)(cti)
+            report.refs["exported"] = object_id
+            if scope == "entity":
+                cti.ask_entity_export(object_id, mime)
+            else:
+                cti.ask_export([object_id], mime, entity_type)
 
         def done() -> list[dict] | None:
             works = _connector_works(cti, connector_id, started)
-            finished = [w for w in works if w["status"] == "complete"]
-            return finished or None
+            return [w for w in works if w["status"] == "complete"] or None
 
         finished, works = wait_until(done, timeout or spec.timeout, 10)
         works = works or _connector_works(cti, connector_id, started)
@@ -802,26 +876,35 @@ def connector_test(
             return report
         errors = [e for w in works for e in w.get("errors") or []]
         report.check("its works report no error", not errors, errors[:5])
-        processed = sum(w.get("completed_number") or 0 for w in works)
-        report.check(
-            f"its works processed at least {spec.min_elements} element(s)",
-            processed >= spec.min_elements,
-            processed,
-        )
+        if spec.family in ("external-import", "internal-import-file"):
+            processed = sum(w.get("completed_number") or 0 for w in works)
+            report.check(
+                f"its works processed at least {spec.min_elements} element(s)",
+                processed >= spec.min_elements,
+                processed,
+            )
         since = datetime.fromtimestamp(started - 5, UTC).strftime("%Y-%m-%dT%H:%M:%S.000Z")
-        changed = cti.changed_since(since)
-        types = sorted({c.get("relationship_type") or c.get("entity_type") for c in changed})
-        report.evidence["ingested_types"] = types
+        changed = cti.changed_since(since, creator_id=user_id)
+        ingested = sorted({c.get("relationship_type") or c.get("entity_type") for c in changed})
+        report.evidence["ingested_types"] = ingested
+        sent = _sent_types(bundles_dir)
+        report.evidence["sent_types"] = sent
         if spec.expected_types:
             report.check(
-                f"ingested types include {sorted(spec.expected_types)}",
-                spec.expected_types <= set(types),
-                types,
+                f"it sent {sorted(spec.expected_types)}",
+                spec.expected_types <= set(sent),
+                sent,
             )
-        for path in spec.calls:
-            calls = fake.journal(path)
-            report.evidence.setdefault("vendor_calls", {})[path] = calls[:2]
-            report.check(f"connector called {path}", calls, "no call recorded")
+        if spec.family == "internal-export-file" and spec.export:
+            files = cti.export_files(entity_type, object_id if scope == "entity" else None)
+            mine = [f for f in files if f"(staticfire {spec.recipe})" in f["name"]]
+            report.evidence["export_files"] = mine[:3]
+            report.check(
+                "it produced a non-empty export file",
+                any((f.get("size") or 0) > 0 for f in mine),
+                [f["name"] for f in files][:5],
+            )
+        _vendor_call_checks(report, fake, spec)
     except Exception as err:
         report.error = f"{type(err).__name__}: {err}"
     finally:
@@ -829,9 +912,74 @@ def connector_test(
             report.evidence["connector_log"] = _safe_tail(run_name)
         if not keep:
             runner.stop(run_name)
-            if fake and fake.started:
-                runner.stop(fakes.OFAPI_RUN)
     return report
+
+
+def _sent_types(bundles_dir: Path) -> list[str]:
+    """STIX types of the bundles the connector sent ("relationship:<type>" for relationships)."""
+    types = set()
+    for path in bundles_dir.glob("*.json"):
+        try:
+            message = json.loads(path.read_text())
+            # pycti wraps the bundle with its sending metadata
+            objects = message.get("bundle", message).get("objects", [])
+        except ValueError:
+            continue
+        for obj in objects:
+            types.add(obj.get("type"))
+            if obj.get("type") == "relationship":
+                types.add(f"relationship:{obj.get('relationship_type')}")
+    return sorted(filter(None, types))
+
+
+def _vendor_call_checks(report: Report, fake, spec) -> None:
+    for path in spec.calls:
+        calls = fake.journal(path)
+        report.evidence.setdefault("vendor_calls", {})[path] = calls[:2]
+        report.check(f"connector called {path}", calls, "no call recorded")
+    unrouted = {e["path"].split("/")[2] for e in fake.journal("/_unrouted/")}
+    if unrouted:
+        # Shared by concurrent tests: a hint, not a verdict
+        report.evidence["unrouted_hosts"] = sorted(unrouted)
+
+
+def _stream_checks(report: Report, cti, fake, spec, timeout: float | None) -> None:
+    """A stream connector must forward what is created once it listens to its vendor: the
+    unique values of the created objects must show in what the vendor received."""
+    time.sleep(15)  # let it connect to the stream
+    markers = (spec.stream or _default_stream_objects)(cti)
+    report.refs["markers"] = markers
+
+    def forwarded() -> list[dict] | None:
+        calls = [e for path in spec.calls for e in fake.journal(path)]
+        return [e for e in calls if any(m in json.dumps(e) for m in markers)] or None
+
+    _, found = wait_until(forwarded, timeout or spec.timeout, 5)
+    _vendor_call_checks(report, fake, spec)
+    if not spec.calls:
+        report.check("the spec names the vendor calls to expect", False, "calls is empty")
+        return
+    report.evidence["forwarded"] = (found or [])[:2]
+    report.check(f"the vendor received the new objects ({', '.join(markers)})", found, None)
+
+
+def _default_stream_objects(cti) -> list[str]:
+    """An indicator on a new domain and a new IPv4 observable; their values as markers."""
+    token = uuid.uuid4().hex[:8]
+    domain = f"sf-{token}.example.com"
+    ip = f"198.51.{int(token[:2], 16) % 256}.{int(token[2:4], 16) % 254 + 1}"
+    cti.create_indicator(f"staticfire {domain}", f"[domain-name:value = '{domain}']", "Domain-Name")
+    cti.create_observable("IPv4-Addr", ip)
+    return [domain, ip]
+
+
+def _default_export_object(cti) -> tuple[str, str]:
+    indicator = cti.create_indicator(
+        f"staticfire export {uuid.uuid4().hex[:8]}",
+        "[ipv4-addr:value = '198.51.100.7']",
+        "IPv4-Addr",
+    )
+    return indicator["id"], "Indicator"
 
 
 def _safe_tail(run_name: str) -> str | None:
@@ -913,7 +1061,13 @@ def run_recipe(profile: Profile, name: str, **options) -> Report:
     accepted = inspect.signature(fn).parameters
     report = fn(profile, **{k: v for k, v in options.items() if k in accepted and v})
     try:
-        logs = logscan.review(log_profile, started_at, skew, platform)
+        # Connector recipes may run concurrently: only their own run's component log is theirs
+        own = (
+            [f"connector-{Path(connector_vendors.SPECS[name].connector).name}"]
+            if (platform == "opencti")
+            else None
+        )
+        logs = logscan.review(log_profile, started_at, skew, platform, runs=own)
         report.evidence["logs"] = logs
         report.refs["logs"] = logscan.one_line(logs)
     except Exception as err:  # the review must never hide the recipe's own verdict
@@ -927,27 +1081,45 @@ def matrix(
     all_verdicts: bool = False,
     out_dir: Path | None = None,
     progress: Callable[[dict], None] | None = None,
+    jobs: int = 1,
 ) -> list[dict]:
-    """Run recipes one after the other (they share the platform and the fake)."""
-    rows = []
-    for name in names or list(RECIPES):
-        for verdict in verdicts_of(name) if all_verdicts else [None]:
-            report = run_recipe(profile, name, verdict=verdict)
-            row = {
-                "recipe": name,
-                "verdict": verdict or "",
-                "result": report.verdict,
-                "duration_s": report.to_dict()["duration_s"],
-                "failed": [c.name for c in report.checks if not c.ok],
-                "error": report.error,
-                "logs": report.refs.get("logs", ""),
-            }
-            if out_dir:
-                out_dir.mkdir(parents=True, exist_ok=True)
-                target = out_dir / f"{name}{'-' + verdict if verdict else ''}.json"
-                target.write_text(json.dumps(report.to_dict(), indent=2, default=str))
-                row["report"] = str(target)
-            rows.append(row)
-            if progress:
-                progress(row)
+    """Run recipes and summarise them. OpenAEV recipes share the platform and the fake, so they
+    run one after the other; connector recipes are independent and run ``jobs`` at a time."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    def one(name: str, verdict: str | None) -> dict:
+        report = run_recipe(profile, name, verdict=verdict)
+        row = {
+            "recipe": name,
+            "verdict": verdict or "",
+            "result": report.verdict,
+            "duration_s": report.to_dict()["duration_s"],
+            "failed": [c.name for c in report.checks if not c.ok],
+            "error": report.error or report.skipped,
+            "logs": report.refs.get("logs", ""),
+        }
+        if out_dir:
+            out_dir.mkdir(parents=True, exist_ok=True)
+            target = out_dir / f"{name}{'-' + verdict if verdict else ''}.json"
+            target.write_text(json.dumps(report.to_dict(), indent=2, default=str))
+            row["report"] = str(target)
+        if progress:
+            progress(row)
+        return row
+
+    runs = [
+        (name, verdict)
+        for name in names or list(RECIPES)
+        for verdict in (verdicts_of(name) if all_verdicts else [None])
+    ]
+    serial = [run for run in runs if run[0] not in connector_vendors.SPECS]
+    parallel = [run for run in runs if run[0] in connector_vendors.SPECS]
+    rows = [one(*run) for run in serial]
+    # Specs of one connector share its run: they go one after the other
+    by_connector: dict[str, list] = {}
+    for run in parallel:
+        by_connector.setdefault(connector_vendors.SPECS[run[0]].connector, []).append(run)
+    with ThreadPoolExecutor(max_workers=max(1, jobs)) as pool:
+        groups = pool.map(lambda group: [one(*run) for run in group], by_connector.values())
+        rows += [row for group in groups for row in group]
     return rows

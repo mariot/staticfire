@@ -25,6 +25,7 @@ from staticfire.config import STATE_DIR, Profile
 # platform-side registration instead of piling up ghost injectors/collectors.
 ID_NAMESPACE = uuid.UUID("5f7a1c2e-9b3d-4e8f-a6c1-2d4b6e8f0a1c")
 RUNS_DIR = STATE_DIR / "runs"
+HOMEBREW_LIB = "/opt/homebrew/lib"
 VENVS_DIR = STATE_DIR / "venvs"
 KINDS = ("injector", "collector", "connector")
 # Folders of the OpenCTI connectors repository, each holding connectors of one type
@@ -294,6 +295,8 @@ def base_env(component: Component, profile: Profile, log_level: str = "info") ->
             "CONNECTOR_LOG_LEVEL": log_level,
             # OpenCTI advertises its RabbitMQ by its Docker name: reach it on the platform host
             "MQ_HOST": profile.host or "",
+            # Homebrew's libraries (cairo, pango...) for the packages loading them with ctypes
+            **({"DYLD_FALLBACK_LIBRARY_PATH": HOMEBREW_LIB} if Path(HOMEBREW_LIB).is_dir() else {}),
         }
     prefix = component.kind.upper()
     env = {

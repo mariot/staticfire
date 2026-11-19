@@ -408,9 +408,15 @@ def matrix_cmd(
     names: Annotated[list[str] | None, typer.Argument(help="Recipes (default: all)")] = None,
     all_verdicts: Annotated[bool, typer.Option(help="Run every verdict of each recipe")] = False,
     out: Annotated[str | None, typer.Option(help="Directory for the JSON reports")] = None,
+    connectors: Annotated[
+        bool, typer.Option(help="Every OpenCTI connector recipe (with or without names)")
+    ] = False,
+    jobs: Annotated[int, typer.Option(help="Connector recipes run at the same time")] = 1,
     profile: ProfileOpt = None,
 ):
-    """Run several recipes one after the other and print a summary table."""
+    """Run several recipes and print a summary table (SKIP: cannot run offline, not a failure)."""
+    if connectors:
+        names = [*(names or []), *recipes.connector_vendors.SPECS]
     unknown = [n for n in names or [] if n not in recipes.RECIPES]
     if unknown:
         raise typer.BadParameter(f"Unknown recipes {unknown}")
@@ -418,14 +424,17 @@ def matrix_cmd(
     def show(row: dict) -> None:
         detail = row["error"] or ", ".join(row["failed"])
         typer.echo(
-            f"{row['result']:5} {row['recipe']:24} {row['verdict']:10} "
+            f"{row['result']:5} {row['recipe']:30} {row['verdict']:10} "
             f"{row['duration_s']:6.1f}s [{row['logs']}] {detail}"
         )
 
-    rows = recipes.matrix(_profile(profile), names, all_verdicts, Path(out) if out else None, show)
+    rows = recipes.matrix(
+        _profile(profile), names, all_verdicts, Path(out) if out else None, show, jobs
+    )
     passed = sum(r["result"] == "PASS" for r in rows)
-    typer.echo(f"{passed}/{len(rows)} passed")
-    raise typer.Exit(0 if passed == len(rows) else 1)
+    skipped = sum(r["result"] == "SKIP" for r in rows)
+    typer.echo(f"{passed}/{len(rows) - skipped} passed, {skipped} skipped")
+    raise typer.Exit(0 if passed + skipped == len(rows) else 1)
 
 
 def main() -> None:
