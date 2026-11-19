@@ -50,17 +50,20 @@ def fire_recipe(
     injector_path: str | None = None,
     collector_path: str | None = None,
     pyoaev: str | None = None,
+    verdict: str | None = None,
     profile: str | None = None,
 ) -> dict:
     """Run an end-to-end recipe and return its report (verdict PASS/FAIL/ERROR, named checks,
     links and evidence). Paths default to sibling checkouts of the injectors/collectors repos;
-    pass a path to test another checkout or branch. pyoaev: local client-python checkout."""
+    pass a path to test another checkout or branch. pyoaev: local client-python checkout.
+    verdict (cortex-xdr): what the scripted XDR reports, prevented, detected or none."""
     fn = recipes.RECIPES[recipe]
     options = {
         "keep": keep,
         "injector_path": injector_path,
         "collector_path": collector_path,
         "pyoaev": pyoaev,
+        "verdict": verdict,
     }
     accepted = inspect.signature(fn).parameters
     return fn(_p(profile), **{k: v for k, v in options.items() if k in accepted and v}).to_dict()

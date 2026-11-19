@@ -312,6 +312,9 @@ def fire(
     injector_path: str | None = None,
     collector_path: str | None = None,
     pyoaev: Annotated[str | None, typer.Option(help="Local pyoaev checkout to use")] = None,
+    verdict: Annotated[
+        str | None, typer.Option(help="cortex-xdr: prevented, detected or none")
+    ] = None,
     as_json: Annotated[bool, typer.Option("--json", help="Full JSON report")] = False,
     profile: ProfileOpt = None,
 ):
@@ -327,6 +330,7 @@ def fire(
         "injector_path": injector_path,
         "collector_path": collector_path,
         "pyoaev": pyoaev,
+        "verdict": verdict,
     }
     accepted = inspect.signature(fn).parameters
     result = fn(_profile(profile), **{k: v for k, v in options.items() if k in accepted and v})

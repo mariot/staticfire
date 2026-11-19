@@ -27,6 +27,7 @@ ID_NAMESPACE = uuid.UUID("5f7a1c2e-9b3d-4e8f-a6c1-2d4b6e8f0a1c")
 RUNS_DIR = STATE_DIR / "runs"
 VENVS_DIR = STATE_DIR / "venvs"
 KINDS = ("injector", "collector")
+INSTALLED_MARKER = ".staticfire-installed"
 
 
 class RunnerError(RuntimeError):
@@ -51,6 +52,11 @@ class Component:
     @property
     def python(self) -> Path:
         return self.venv / "bin" / "python"
+
+    @property
+    def installed(self) -> bool:
+        """Set by a complete install only: a failed one leaves a virtualenv without it."""
+        return (self.venv / INSTALLED_MARKER).exists()
 
 
 def detect(path: str | Path, kind: str | None = None) -> Component:
@@ -86,10 +92,13 @@ def _module(root: Path) -> str:
 def install(component: Component, pyoaev: str | None = None, fresh: bool = False) -> str:
     """Create/refresh the component virtualenv; returns the installer output."""
     root = Path(component.path)
+    python = _required_python(root)
+    if component.python.exists() and _venv_python(component) < python:
+        fresh = True  # the component now requires a newer Python than its virtualenv has
     if fresh and component.venv.exists():
         subprocess.run(["rm", "-rf", str(component.venv)], check=True)
     if not component.python.exists():
-        _run(["uv", "venv", "--python", "3.12", str(component.venv)])
+        _run(["uv", "venv", "--python", ".".join(map(str, python)), str(component.venv)])
     requirements = ["-e", str(root)]
     # Injectors depend on the shared injector_common package through a relative path
     if (
@@ -107,7 +116,25 @@ def install(component: Component, pyoaev: str | None = None, fresh: bool = False
         output += _run(
             ["uv", "pip", "install", "--python", str(component.python), _pyoaev_pin(root)]
         )
+    (component.venv / INSTALLED_MARKER).write_text(component.path + "\n")
     return output
+
+
+def _required_python(root: Path) -> tuple[int, int]:
+    """Lowest Python the component accepts (requires-python), at least 3.11."""
+    project = tomllib.loads((root / "pyproject.toml").read_text()).get("project", {})
+    m = re.search(r">=\s*3\.(\d+)", project.get("requires-python", ""))
+    return (3, max(int(m.group(1)), 11) if m else 12)
+
+
+def _venv_python(component: Component) -> tuple[int, int]:
+    out = subprocess.run(
+        [str(component.python), "-c", "import sys; print(*sys.version_info[:2])"],
+        capture_output=True,
+        text=True,
+        check=False,
+    ).stdout.split()
+    return (int(out[0]), int(out[1])) if len(out) == 2 else (0, 0)
 
 
 def _importable(component: Component, module: str) -> bool:
@@ -189,21 +216,44 @@ def start(
     run_name: str | None = None,
     log_level: str = "info",
 ) -> Run:
-    if not component.python.exists():
+    if not component.installed:
         raise RunnerError(f"{component.name} is not installed yet, run install first")
-    run_name = run_name or f"{component.kind}-{component.name}"
+    env = {**base_env(component, profile, log_level), **(extra_env or {})}
+    return spawn(
+        run_name or f"{component.kind}-{component.name}",
+        [str(component.python), "-u", "-m", component.module],
+        cwd=component.path,
+        env=env,
+        kind=component.kind,
+        name=component.name,
+        component_id=component.component_id,
+        module=component.module,
+    )
+
+
+def spawn(
+    run_name: str,
+    argv: list[str],
+    cwd: str,
+    env: dict[str, str],
+    kind: str,
+    name: str,
+    component_id: str = "",
+    module: str = "",
+) -> Run:
+    """Start a detached process group logging to the run directory."""
     if (existing := get_run(run_name)) and existing.alive:
         raise RunnerError(f"{run_name} is already running (pid {existing.pid}), stop it first")
     run_dir = _run_dir(run_name)
     run_dir.mkdir(parents=True, exist_ok=True)
     log_path = run_dir / f"{time.strftime('%Y%m%d-%H%M%S')}.log"
-    env = {**os.environ, **base_env(component, profile, log_level), **(extra_env or {})}
-    env.pop("VIRTUAL_ENV", None)
+    full_env = {**os.environ, **env}
+    full_env.pop("VIRTUAL_ENV", None)
     with log_path.open("wb") as log:
         process = subprocess.Popen(
-            [str(component.python), "-u", "-m", component.module],
-            cwd=component.path,
-            env=env,
+            argv,
+            cwd=cwd,
+            env=full_env,
             stdout=log,
             stderr=subprocess.STDOUT,
             stdin=subprocess.DEVNULL,
@@ -211,15 +261,15 @@ def start(
         )
     run = Run(
         run_name=run_name,
-        kind=component.kind,
-        name=component.name,
-        component_id=component.component_id,
+        kind=kind,
+        name=name,
+        component_id=component_id,
         pid=process.pid,
         log=str(log_path),
         started_at=time.time(),
-        module=component.module,
-        path=component.path,
-        env_keys=sorted({*base_env(component, profile), *(extra_env or {})}),
+        module=module,
+        path=cwd,
+        env_keys=sorted(env),
     )
     (run_dir / "run.json").write_text(json.dumps(asdict(run), indent=2))
     return run

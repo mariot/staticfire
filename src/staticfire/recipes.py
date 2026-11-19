@@ -7,12 +7,14 @@ they need from their checkouts and stop them afterwards unless ``keep`` is set.
 from __future__ import annotations
 
 import os
+import time
 import uuid
 from collections.abc import Callable
 from pathlib import Path
 
-from staticfire import ops, runner
+from staticfire import fakes, ops, runner
 from staticfire.config import Profile
+from staticfire.openaev import wait_until
 from staticfire.report import Report
 
 STATICFIRE_ROOT = Path(__file__).resolve().parents[2]
@@ -181,7 +183,7 @@ def mailpit_collector(
             mine = [
                 r
                 for r in (by_type.get(kind) or {}).get("results", [])
-                if r["source_id"] == collector_id
+                if r["source_id"] == collector_id and r["result"]
             ]
             report.check(
                 f"{kind} answered '{expected}' by the collector",
@@ -208,6 +210,145 @@ def mailpit_collector(
     return report
 
 
+XDR_ALERTS_PATH = "/palo-alto-cortex-xdr/public_api/v1/alerts/get_alerts_multi_events"
+XDR_VERDICTS = {
+    # verdict -> (alerts the fake XDR returns, result expected per expectation type)
+    "prevented": (
+        ["Detected (Reported)", "Prevented (Blocked)"],
+        {"DETECTION": "Detected", "PREVENTION": "Prevented"},
+    ),
+    "detected": (["Detected (Reported)"], {"DETECTION": "Detected", "PREVENTION": None}),
+    "none": ([], {"DETECTION": None, "PREVENTION": None}),
+}
+
+
+def _xdr_alert(alert_id: int, implant: str, action_pretty: str, timestamp_ms: int) -> dict:
+    return {
+        "external_id": f"staticfire-{alert_id}",
+        "severity": "high",
+        "matching_status": "MATCHED",
+        "case_id": None,
+        "alert_id": alert_id,
+        "actor_process_command_line": implant,
+        "category": "Malware",
+        "description": "Alert scripted by staticfire",
+        "action": action_pretty.split(" ")[0].upper(),
+        "action_pretty": action_pretty,
+        "detection_timestamp": timestamp_ms,
+        # The implant in the events lets the collector match without enrichment calls
+        "events": [{"actor_process_image_name": implant}],
+    }
+
+
+def cortex_xdr(
+    profile: Profile,
+    collector_path: str | None = None,
+    verdict: str = "prevented",
+    asset_id: str | None = None,
+    keep: bool = False,
+    timeout: float = 240,
+) -> Report:
+    """Collector test: real agent expectations, a scripted Cortex XDR, the real XDR collector.
+
+    The agent runs a marker command; the fake XDR (ofapi) answers with alerts naming that
+    implant process; the palo-alto-cortex-xdr collector must match them and report the verdict
+    to OpenAEV. verdict: prevented (detect + prevent), detected (detect only) or none.
+    """
+    alerts_actions, expected = XDR_VERDICTS[verdict]
+    report = Report(f"cortex-xdr ({verdict})")
+    collector = checkout("collectors", "palo-alto-cortex-xdr", collector_path)
+    run_name = f"collector-{Path(collector).name}"
+    try:
+        fake = fakes.ofapi_up()
+        fake.reset()
+        report.refs["vendor_fake"] = fake.base
+        made = ops.agent_expectations(profile, asset_id)
+        report.refs["inject_id"] = made["inject_id"]
+        report.refs["inject"] = made["link"]
+        report.refs["endpoint"] = f"{made['endpoint']['name']} ({made['endpoint']['asset_id']})"
+        report.check("agent executes the marker payload", made["status"] == "EXECUTED", made)
+        implants = {
+            s["value"]
+            for e in made["pending"]
+            for s in e["signatures"]
+            if s["type"] == "parent_process_name"
+        }
+        report.evidence["pending_expectations"] = made["pending"]
+        if not report.check("expectations carry the implant process", implants, made["pending"]):
+            return report
+        implant = sorted(implants)[0]
+        # The collector looks for alerts up to the expectation end date: stamp them there
+        ended = next(
+            (
+                s["value"]
+                for e in made["pending"]
+                for s in e["signatures"]
+                if s["type"] == "end_date"
+            ),
+            None,
+        )
+        stamp = ops.parse_date(ended).timestamp() if ended else time.time()
+        alerts = [
+            _xdr_alert(i + 1, implant, action, int(stamp * 1000))
+            for i, action in enumerate(alerts_actions)
+        ]
+        reply = {"total_count": len(alerts), "result_count": len(alerts), "alerts": alerts}
+        fake.rule(XDR_ALERTS_PATH, [{"body": {"reply": reply}}])
+        up = _start(
+            report,
+            profile,
+            collector,
+            "collector",
+            kind="collector",
+            env={
+                "PALO_ALTO_CORTEX_XDR_FQDN": fake.url("palo-alto-cortex-xdr"),
+                "PALO_ALTO_CORTEX_XDR_API_KEY": "staticfire-fake-key",
+                "PALO_ALTO_CORTEX_XDR_API_KEY_ID": "1",
+                "COLLECTOR_PERIOD": "PT15S",
+                "REQUESTS_CA_BUNDLE": str(fake.cert),
+            },
+        )
+        if not up:
+            return report
+        collector_id = up["component"]["id"]
+        asset = made["endpoint"]["asset_id"]
+        answered_types = tuple(t for t, result in expected.items() if result)
+        if answered_types:
+            done, expectations = ops.wait_expectations(
+                profile, made["inject_id"], asset, collector_id, answered_types, timeout
+            )
+            report.check(f"collector answers {', '.join(answered_types)} in time", done)
+        else:
+            # Nothing to wait for: give the collector a few cycles to (wrongly) answer
+            wait_until(lambda: False, 50, 5)
+            expectations = ops.expectations_of_target(ops.client(profile), made["inject_id"], asset)
+        report.evidence["expectations"] = expectations
+        for kind, result in expected.items():
+            mine = [
+                r["result"]
+                for e in expectations
+                if e["type"] == kind
+                for r in e["results"]
+                # OpenAEV pre-creates an empty result slot per collector it expects an answer from
+                if r["source_id"] == collector_id and r["result"]
+            ]
+            if result:
+                report.check(f"{kind} answered '{result}' by the collector", mine == [result], mine)
+            else:
+                report.check(f"{kind} left unanswered by the collector", not mine, mine)
+        calls = fake.journal(XDR_ALERTS_PATH)
+        report.evidence["vendor_calls"] = calls[:3]
+        report.check("collector queried the XDR alerts API", calls, "no call recorded")
+    except Exception as err:
+        report.error = f"{type(err).__name__}: {err}"
+    finally:
+        if report.verdict != "PASS":
+            report.evidence["collector_log"] = _safe_tail(run_name)
+        if not keep:
+            runner.stop(run_name)
+    return report
+
+
 def _safe_tail(run_name: str) -> str | None:
     try:
         return runner.tail(run_name, 40)
@@ -218,6 +359,7 @@ def _safe_tail(run_name: str) -> str | None:
 RECIPES: dict[str, Callable[..., Report]] = {
     "email-smtp": email_smtp,
     "mailpit-collector": mailpit_collector,
+    "cortex-xdr": cortex_xdr,
 }
 
 DESCRIPTIONS = {
@@ -225,4 +367,7 @@ DESCRIPTIONS = {
     "mailpit received it with the right sender, recipients, subject, body and header.",
     "mailpit-collector": "Collector test: an email inject with DETECTION/PREVENTION expectations "
     "on an agent endpoint, answered by the mailpit collector (Detected / Not Prevented).",
+    "cortex-xdr": "Collector test: the agent runs a marker command, a scripted Cortex XDR "
+    "(ofapi) reports alerts on that implant, the palo-alto-cortex-xdr collector must answer "
+    "OpenAEV. Option verdict: prevented (default), detected or none.",
 }

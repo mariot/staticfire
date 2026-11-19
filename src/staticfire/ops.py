@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import time
 import uuid
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -32,6 +33,17 @@ NETWORK_SIGNATURES = {
     "target_ipv4_address",
     "target_ipv6_address",
 }
+
+
+def parse_date(value: str) -> datetime:
+    """OpenAEV dates carry nanoseconds, which datetime cannot parse: keep microseconds."""
+    value = value.replace("Z", "+00:00")
+    if "." in value:
+        head, tail = value.split(".", 1)
+        digits = "".join(ch for ch in tail if ch.isdigit())
+        value = f"{head}.{digits[:6]}{tail[len(digits) :]}"
+    parsed = datetime.fromisoformat(value)
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
 
 
 def client(profile: Profile) -> OpenAEV:
@@ -142,7 +154,7 @@ def component_up(
     component = runner.detect(path, kind)
     run_name = f"{component.kind}-{component.name}"
     install_output = None
-    if install == "always" or (install == "auto" and not component.python.exists()) or pyoaev:
+    if install == "always" or (install == "auto" and not component.installed) or pyoaev:
         install_output = runner.install(component, pyoaev=pyoaev)
     if restart:
         runner.stop(run_name)
