@@ -91,6 +91,9 @@ Each gets a stable id derived from its name, so reruns reuse the platform-side r
 claude mcp add staticfire -- uv --directory ~/GitHub/staticfire run staticfire-mcp
 ```
 
+A recipe takes one to three minutes; if the client gives up first, raise its tool timeout (Claude
+Code: `MCP_TOOL_TIMEOUT`, in milliseconds).
+
 Tools: `status`, `list_recipes`, `fire_recipe`, `component_up`, `component_down`,
 `component_logs`, `list_runs`, `injector_contracts`, `run_inject`, `inject_report`,
 `pending_expectations`, `agent_expectations`, `wait_expectations`, `launch_scenario`,
