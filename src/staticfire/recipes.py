@@ -753,6 +753,10 @@ def _connector_works(cti, connector_id: str, since: float) -> list[dict]:
     return works
 
 
+# A connector run is over when its works are complete and it sent nothing for this long
+QUIET_SECONDS = 30
+
+
 def _service_token(profile: Profile, cti, name: str) -> tuple[str, str]:
     """(user id, token) of the connector's own service account, reusing a stored token."""
     store = config.STATE_DIR / "opencti-users.json"
@@ -838,6 +842,8 @@ def connector_test(
             **connector_vendors.schema_placeholders(connector_dir, env),
             **env,
         }
+        # Every run starts from a blank state (two specs of one connector share its id)
+        cti.reset_state(runner.detect(str(connector_dir), "connector").component_id)
         started = time.time()
         up = _start(report, profile, str(connector_dir), "connector", kind="connector", env=env)
         if not up:
@@ -865,9 +871,18 @@ def connector_test(
             else:
                 cti.ask_export([object_id], mime, entity_type)
 
+        settled = {"bundles": -1, "since": time.time()}
+
         def done() -> list[dict] | None:
+            """Every work complete, and no new bundle for a while: a run sending one bundle per
+            page looks complete between two pages."""
             works = _connector_works(cti, connector_id, started)
-            return [w for w in works if w["status"] == "complete"] or None
+            bundles = len(list(bundles_dir.glob("*.json")))
+            if bundles != settled["bundles"]:
+                settled.update(bundles=bundles, since=time.time())
+            if not works or any(w["status"] != "complete" for w in works):
+                return None
+            return works if time.time() - settled["since"] >= QUIET_SECONDS else None
 
         finished, works = wait_until(done, timeout or spec.timeout, 10)
         works = works or _connector_works(cti, connector_id, started)
@@ -936,7 +951,7 @@ def _vendor_call_checks(report: Report, fake, spec) -> None:
     for path in spec.calls:
         calls = fake.journal(path)
         report.evidence.setdefault("vendor_calls", {})[path] = calls[:2]
-        report.check(f"connector called {path}", calls, "no call recorded")
+        report.check(f"connector called {path}", calls, None if calls else "no call recorded")
     unrouted = {e["path"].split("/")[2] for e in fake.journal("/_unrouted/")}
     if unrouted:
         # Shared by concurrent tests: a hint, not a verdict

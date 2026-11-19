@@ -60,6 +60,16 @@ class OpenCTI:
             {"id": connector_id},
         )["connector"]
 
+    def reset_state(self, connector_id: str) -> None:
+        """Forget a connector's state (last run...), if the connector is known."""
+        try:
+            self.graphql(
+                "mutation ($id: ID!) { resetStateConnector(id: $id) { id } }",
+                {"id": connector_id},
+            )
+        except OpenCTIError:
+            pass  # never registered yet
+
     def changed_since(
         self, since_iso: str, creator_id: str | None = None, first: int = 500
     ) -> list[dict]:
