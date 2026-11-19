@@ -19,6 +19,8 @@ from staticfire.openaev import wait_until
 
 OFAPI_RUN = "fake-ofapi"
 OFAPI_PORT = int(os.environ.get("STATICFIRE_OFAPI_PORT", "8443"))
+OFAPI_HTTP_PORT = int(os.environ.get("STATICFIRE_OFAPI_HTTP_PORT", "8000"))
+LAUNCHER = Path(__file__).with_name("ofapi_dual.py")
 TLS_DIR = STATE_DIR / "tls"
 
 
@@ -54,10 +56,13 @@ def ofapi_checkout(path: str | None = None) -> str:
 
 
 class Ofapi:
-    def __init__(self, port: int = OFAPI_PORT):
+    """The same fake on https://127.0.0.1:<port> and http://127.0.0.1:<http_port>."""
+
+    def __init__(self, port: int = OFAPI_PORT, http_port: int = OFAPI_HTTP_PORT):
         cert, _ = tls_files()
         self.cert = cert
         self.base = f"https://127.0.0.1:{port}"
+        self.http_base = f"http://127.0.0.1:{http_port}"
         self.http = httpx.Client(base_url=self.base, verify=str(cert), timeout=10)
         # Whether ofapi_up started this instance (a recipe then stops it) or reused one
         self.started = False
@@ -65,6 +70,12 @@ class Ofapi:
     def url(self, path: str) -> str:
         """What a collector needs as its vendor host, e.g. ``127.0.0.1:8443/<vendor>``."""
         return f"{self.base.removeprefix('https://')}/{path.strip('/')}"
+
+    def http_url(self, path: str = "") -> str:
+        return f"{self.http_base}/{path.strip('/')}".rstrip("/")
+
+    def https_url(self, path: str = "") -> str:
+        return f"{self.base}/{path.strip('/')}".rstrip("/")
 
     def alive(self) -> bool:
         try:
@@ -88,7 +99,7 @@ class Ofapi:
 
 
 def ofapi_up(path: str | None = None, port: int = OFAPI_PORT, timeout: float = 60) -> Ofapi:
-    """Reuse a running ofapi on the port, or start one from its checkout."""
+    """Reuse a running ofapi on the port, or start one from its checkout (HTTP and TLS)."""
     fake = Ofapi(port)
     if fake.alive():
         return fake
@@ -98,9 +109,8 @@ def ofapi_up(path: str | None = None, port: int = OFAPI_PORT, timeout: float = 6
     runner.spawn(
         OFAPI_RUN,
         [
-            "uv", "run", "--directory", checkout,
-            "uvicorn", "app.main:app", "--host", "127.0.0.1", "--port", str(port),
-            "--ssl-keyfile", str(key), "--ssl-certfile", str(cert),
+            "uv", "run", "--directory", checkout, "python", str(LAUNCHER),
+            str(OFAPI_HTTP_PORT), str(port), str(cert), str(key),
         ],
         cwd=checkout,
         env={},
