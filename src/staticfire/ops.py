@@ -149,13 +149,19 @@ def component_up(
     restart: bool = True,
     log_level: str = "info",
     timeout: float = 120,
+    python_version: str | None = None,
 ) -> dict:
     """Install (if needed), start and wait for an injector/collector to register."""
     component = runner.detect(path, kind)
     run_name = f"{component.kind}-{component.name}"
     install_output = None
-    if install == "always" or (install == "auto" and not component.installed) or pyoaev:
-        install_output = runner.install(component, pyoaev=pyoaev)
+    if (
+        install == "always"
+        or (install == "auto" and not component.installed)
+        or pyoaev
+        or python_version
+    ):
+        install_output = runner.install(component, pyoaev=pyoaev, python_version=python_version)
     if restart:
         runner.stop(run_name)
     elif (existing := runner.get_run(run_name)) and existing.alive:
@@ -256,6 +262,33 @@ def resolve_injector(profile: Profile, ref: str) -> str:
 # -- injects --
 
 
+# Field types whose value the inject carries outside the content, or that staticfire builds itself
+NON_CONTENT_FIELDS = {"expectation", "team", "asset", "asset-group", "attachment", "article"}
+
+
+def contract_defaults(api: OpenAEV, contract_id: str) -> dict:
+    """Default value of every content field, as the UI form starts with them."""
+    try:
+        contract = api.injector_contract(contract_id)
+        fields = json.loads(contract.get("injector_contract_content") or "{}").get("fields", [])
+    except (OpenAEVError, ValueError):
+        return {}
+    return {
+        f["key"]: _form_value(f)
+        for f in fields
+        if f.get("type") not in NON_CONTENT_FIELDS and f.get("defaultValue") is not None
+    }
+
+
+def _form_value(field: dict) -> Any:
+    """The UI form (InjectContentForm) sends the first default of a single-value field: the
+    platform rejects a list there (a choice sent as ['plain-text'] breaks payload generation)."""
+    default = field["defaultValue"]
+    if isinstance(default, list) and field.get("cardinality") == "1":
+        return default[0] if default else ""
+    return default
+
+
 def expectation_content(types: list[str] | tuple[str, ...], expiration: int = 3600) -> list[dict]:
     return [
         {
@@ -280,10 +313,15 @@ def run_inject(
     title: str | None = None,
     timeout: float = 180,
     launch: bool = True,
+    defaults: bool = True,
 ) -> dict:
-    """Create an atomic testing, launch it and wait for its execution to end."""
+    """Create an atomic testing, launch it and wait for its execution to end.
+
+    Fields missing from ``content`` get the contract's default value (as in the UI form), unless
+    ``defaults`` is off: injectors read optional fields without checking they are present.
+    """
     api = client(profile)
-    content = dict(content or {})
+    content = {**(contract_defaults(api, contract_id) if defaults else {}), **(content or {})}
     if expectations:
         content["expectations"] = expectation_content(expectations)
     created = api.create_atomic_testing(
@@ -332,7 +370,12 @@ def inject_report(profile: Profile, inject_id: str, assets: list[str] | None = N
             }
             for t in inject_status.get("status_main_traces") or []
         ],
-        "expectation_results": api.atomic_testing(inject_id).get("inject_expectation_results"),
+        # One summary per expectation type the inject carries: drop those of types it has none of
+        "expectation_results": [
+            r
+            for r in api.atomic_testing(inject_id).get("inject_expectation_results") or []
+            if any(d.get("value") for d in r.get("distribution") or [])
+        ],
     }
     if assets:
         report["targets"] = {

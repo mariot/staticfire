@@ -12,7 +12,7 @@ from typing import Any
 
 from mcp.server.mcpserver import MCPServer
 
-from staticfire import config, ops, recipes, runner
+from staticfire import config, fakes, ops, recipes, runner
 
 mcp = MCPServer(
     "staticfire",
@@ -77,10 +77,12 @@ def component_up(
     pyoaev: str | None = None,
     reinstall: bool = False,
     timeout: float = 120,
+    python_version: str | None = None,
     profile: str | None = None,
 ) -> dict:
     """Install (own virtualenv), start and wait for an injector or collector checkout to
-    register with the platform. env: extra settings such as vendor base URLs. Returns the run
+    register with the platform. env: extra settings such as vendor base URLs. python_version
+    forces the virtualenv's Python (default: lowest the component allows, 3.12+). Returns the run
     (pid, log path), the registered entity and, for injectors, their contracts and fields."""
     return ops.component_up(
         _p(profile),
@@ -90,6 +92,7 @@ def component_up(
         pyoaev=pyoaev,
         install="always" if reinstall else "auto",
         timeout=timeout,
+        python_version=python_version,
     )
 
 
@@ -128,10 +131,13 @@ def run_inject(
     expectations: list[str] | None = None,
     title: str | None = None,
     timeout: float = 180,
+    defaults: bool = True,
     profile: str | None = None,
 ) -> dict:
     """Create an atomic testing with this contract and content, launch it and wait for it to
-    end. expectations: types to attach (DETECTION, PREVENTION); they only become agent
+    end. Fields missing from content get the contract default, as in the UI (defaults=False
+    sends only the given ones); list fields take [{"key": ..., "value": ...}] items.
+    expectations: types to attach (DETECTION, PREVENTION); they only become agent
     expectations collectors can answer when assets with agents are targeted. Returns status,
     execution traces, and per asset the traces and expectation results."""
     return ops.run_inject(
@@ -144,6 +150,7 @@ def run_inject(
         expectations=expectations,
         title=title,
         timeout=timeout,
+        defaults=defaults,
     )
 
 
@@ -195,6 +202,25 @@ def launch_scenario(scenario_id: str, timeout: float = 600, profile: str | None 
     """Start a simulation of a scenario (chained workflows included) and wait for its
     injects to be executed."""
     return ops.launch_scenario(_p(profile), scenario_id, timeout)
+
+
+@mcp.tool()
+def vendor_fake(action: str = "up", path: str = "", limit: int = 20) -> dict | list:
+    """The vendor API fake (ofapi over TLS on 127.0.0.1). action: up (start or reuse; returns
+    its URL and the CA bundle to pass as REQUESTS_CA_BUNDLE), journal (requests received under
+    the path prefix), reset (forget rules and journal) or down. Script answers with
+    POST <url>/_control/rules {"path", "responses": [{"status", "body"}], "then": "last"}."""
+    if action == "up":
+        fake = fakes.ofapi_up()
+        return {"url": fake.base, "started": fake.started, "ca_bundle": str(fake.cert)}
+    if action == "journal":
+        return fakes.Ofapi().journal(path)[-limit:]
+    if action == "reset":
+        fakes.Ofapi().reset()
+        return {"reset": True}
+    if action == "down":
+        return {"stopped": runner.stop(fakes.OFAPI_RUN)}
+    raise ValueError(f"Unknown action {action}")
 
 
 @mcp.tool()

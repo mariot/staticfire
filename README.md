@@ -49,7 +49,8 @@ selects one.
 Each recipe starts what it needs, checks every step and prints a verdict (`PASS`, `FAIL`, `ERROR`)
 with links to the inject in OpenAEV and the message in mailpit; `--json` gives the full report
 with its evidence (traces, delivered message, expectation results, logs on failure). The exit code
-is 0 on `PASS`. Components are stopped at the end unless `--keep`.
+is 0 on `PASS`. Components are stopped at the end unless `--keep`; the vendor fake only if the
+recipe started it.
 
 | Recipe | What is fired | What is checked |
 |---|---|---|
@@ -68,9 +69,16 @@ For components without a recipe, the same steps are available one by one:
 staticfire up ../injectors/nmap -e SOME_SETTING=value   # install, start, wait for registration
 staticfire contracts ../injectors/nmap                  # its contracts and their fields
 staticfire inject <contract-id> --set key=value --asset <endpoint-id> --expect DETECTION
+staticfire inject <contract-id> --content '{"headers": [{"key": "X-A", "value": "1"}]}'
 staticfire report <inject-id> --asset <endpoint-id>     # status, traces, expectation results
 staticfire logs injector-nmap --grep error
 staticfire down injector-nmap
+
+staticfire fake up                            # ofapi over TLS on https://127.0.0.1:8443, prints the CA
+staticfire up ../injectors/http-query -e REQUESTS_CA_BUNDLE=<ca>
+staticfire inject <get-contract-id> --set uri=https://127.0.0.1:8443/echo
+staticfire fake journal --path /echo          # exactly what the injector sent
+staticfire fake down
 
 staticfire agent-expectations                 # the agent runs `echo staticfire-marker <id>`
 staticfire expectations --inject <inject-id>  # what a collector receives, with signatures
@@ -81,9 +89,16 @@ staticfire scenario <scenario-id>             # launch a simulation, wait for it
 staticfire mail search 'to:"x@y.z"'
 ```
 
-Components run detached; their virtualenvs (Python per the component's `requires-python`) live in
-`~/.local/state/staticfire/venvs/`, their logs and pids in `~/.local/state/staticfire/runs/`.
-Each gets a stable id derived from its name, so reruns reuse the platform-side registration.
+- Commands print JSON; `fire` prints a summary (`--json` for the full report).
+- `inject` fills the fields you leave out with the contract defaults, like the UI form does
+  (`--no-defaults` to send only yours): injectors read optional fields without checking for them.
+  `--set` gives one string field, `--content` any JSON (list fields take `{"key", "value"}` items).
+- Components and the fake run on this machine, the platform and the agent in the VM: `127.0.0.1`
+  in an inject is this machine.
+- Components run detached; their virtualenvs live in `~/.local/state/staticfire/venvs/` (the
+  lowest Python the component allows, never below 3.12 since pyoaev needs it; `up --python 3.13`
+  to force one), their logs and pids in `~/.local/state/staticfire/runs/`. Each gets a stable id
+  derived from its name, so reruns reuse the platform-side registration.
 
 ## MCP server
 
@@ -97,7 +112,7 @@ Code: `MCP_TOOL_TIMEOUT`, in milliseconds).
 Tools: `status`, `list_recipes`, `fire_recipe`, `component_up`, `component_down`,
 `component_logs`, `list_runs`, `injector_contracts`, `run_inject`, `inject_report`,
 `pending_expectations`, `agent_expectations`, `wait_expectations`, `launch_scenario`,
-`mail_search`.
+`vendor_fake`, `mail_search`.
 
 ## How the platform side works (what staticfire relies on)
 
@@ -124,6 +139,10 @@ Tools: `status`, `list_recipes`, `fire_recipe`, `component_up`, `component_down`
   signature-manager payload has no agent/asset target, which the platform drops too. An email
   security collector such as `microsoft-defender-o365` therefore cannot match on them. The mailpit
   collector falls back to the inject content (recipients and subject) for that reason.
+- pyoaev 3.261118.0 declares `requires-python >=3.11` but imports `typing.override` (3.12+), so
+  a component installed on 3.11 fails at its first import.
+- `http-query` fails with `'basicAuth'` (a `KeyError`) when an inject omits that optional field;
+  the UI always sends it, an API client may not.
 - Every signature callback leaves a trace reading `Current action: data - Current status: data`:
   pyoaev's `ExecutionDetails.execution_message` (`pyoaev/signatures/models.py`) fills the status
   half from `execution_action` instead of `execution_status`.

@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from staticfire import config, runner
+from staticfire import config, ops, runner
 from staticfire.report import Report
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -105,3 +105,23 @@ def test_collector_splits_recipient_lists():
     module = _collector_module()
     assert module._split("a@x.y, b@x.y;c@x.y") == ["a@x.y", "b@x.y", "c@x.y"]
     assert module._split(None) == []
+
+
+def test_form_value_takes_the_first_default_of_single_value_fields():
+    choice = {"type": "choice", "cardinality": "1", "defaultValue": ["plain-text"]}
+    multiple = {"type": "choice", "cardinality": "n", "defaultValue": ["a", "b"]}
+    text = {"type": "text", "cardinality": "1", "defaultValue": "none"}
+    empty = {"type": "text", "cardinality": "1", "defaultValue": []}
+    assert ops._form_value(choice) == "plain-text"
+    assert ops._form_value(multiple) == ["a", "b"]
+    assert ops._form_value(text) == "none"
+    assert ops._form_value(empty) == ""
+
+
+def test_required_python_never_goes_below_312(tmp_path):
+    root = _checkout(
+        tmp_path, "injectors", "x", None, '[project]\nname = "x"\nrequires-python = ">=3.11,<4.0"\n'
+    )
+    assert runner._required_python(root) == (3, 12)
+    (root / "pyproject.toml").write_text('[project]\nname = "x"\nrequires-python = ">=3.14"\n')
+    assert runner._required_python(root) == (3, 14)

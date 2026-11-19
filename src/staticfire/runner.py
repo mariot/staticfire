@@ -89,10 +89,23 @@ def _module(root: Path) -> str:
     raise RunnerError(f"No entry module found in {root} (Dockerfile CMD or project.scripts)")
 
 
-def install(component: Component, pyoaev: str | None = None, fresh: bool = False) -> str:
-    """Create/refresh the component virtualenv; returns the installer output."""
+def install(
+    component: Component,
+    pyoaev: str | None = None,
+    fresh: bool = False,
+    python_version: str | None = None,
+) -> str:
+    """Create/refresh the component virtualenv; returns the installer output.
+
+    python_version (e.g. "3.13") forces the virtualenv's Python instead of the lowest the
+    component accepts.
+    """
     root = Path(component.path)
-    python = _required_python(root)
+    if python_version:
+        python = tuple(int(part) for part in python_version.split(".")[:2])
+        fresh = fresh or _venv_python(component) != python
+    else:
+        python = _required_python(root)
     if component.python.exists() and _venv_python(component) < python:
         fresh = True  # the component now requires a newer Python than its virtualenv has
     if fresh and component.venv.exists():
@@ -121,13 +134,19 @@ def install(component: Component, pyoaev: str | None = None, fresh: bool = False
 
 
 def _required_python(root: Path) -> tuple[int, int]:
-    """Lowest Python the component accepts (requires-python), at least 3.11."""
+    """Lowest Python the component accepts (requires-python), never below 3.12.
+
+    pyoaev declares >=3.11 but imports typing.override (3.12+): a 3.11 virtualenv installs
+    fine and then fails at the first import.
+    """
     project = tomllib.loads((root / "pyproject.toml").read_text()).get("project", {})
     m = re.search(r">=\s*3\.(\d+)", project.get("requires-python", ""))
-    return (3, max(int(m.group(1)), 11) if m else 12)
+    return (3, max(int(m.group(1)), 12) if m else 12)
 
 
 def _venv_python(component: Component) -> tuple[int, int]:
+    if not component.python.exists():
+        return (0, 0)
     out = subprocess.run(
         [str(component.python), "-c", "import sys; print(*sys.version_info[:2])"],
         capture_output=True,

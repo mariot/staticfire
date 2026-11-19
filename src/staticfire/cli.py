@@ -10,7 +10,7 @@ from typing import Annotated
 
 import typer
 
-from staticfire import config, ops, recipes, runner
+from staticfire import config, fakes, ops, recipes, runner
 from staticfire.openaev import OpenAEVError
 
 app = typer.Typer(
@@ -19,8 +19,10 @@ app = typer.Typer(
 )
 profile_app = typer.Typer(no_args_is_help=True, help="Where the platform under test lives.")
 mail_app = typer.Typer(no_args_is_help=True, help="What the mail catcher (mailpit) received.")
+fake_app = typer.Typer(no_args_is_help=True, help="The vendor API fake (ofapi, over TLS).")
 app.add_typer(profile_app, name="profile")
 app.add_typer(mail_app, name="mail")
+app.add_typer(fake_app, name="fake")
 
 ProfileOpt = Annotated[
     str | None, typer.Option("--profile", "-p", help="Profile name (default: the current one)")
@@ -137,6 +139,10 @@ def up(
     restart: bool = True,
     log_level: str = "info",
     timeout: float = 120,
+    python: Annotated[
+        str | None,
+        typer.Option(help="Python of the virtualenv, e.g. 3.13 (default: lowest allowed)"),
+    ] = None,
     profile: ProfileOpt = None,
 ):
     """Install, start and wait for an injector or collector to register."""
@@ -150,6 +156,7 @@ def up(
         restart=restart,
         log_level=log_level,
         timeout=timeout,
+        python_version=python,
     )
     _print(result)
     if not result.get("registered", True):
@@ -207,9 +214,14 @@ def inject(
     title: str | None = None,
     timeout: float = 180,
     no_launch: bool = False,
+    no_defaults: Annotated[
+        bool, typer.Option(help="Send only the given fields, not the contract defaults")
+    ] = False,
     profile: ProfileOpt = None,
 ):
-    """Create an atomic testing, launch it, wait, and report status/traces/expectations."""
+    """Create an atomic testing, launch it, wait, and report status/traces/expectations.
+
+    Fields not given get the contract default, as in the UI form."""
     data = {}
     if content:
         data = json.loads(Path(content[1:]).read_text() if content.startswith("@") else content)
@@ -226,6 +238,7 @@ def inject(
             title=title,
             timeout=timeout,
             launch=not no_launch,
+            defaults=not no_defaults,
         )
     )
 
@@ -300,6 +313,45 @@ def mail_search(
 @mail_app.command("show")
 def mail_show(message_id: str, profile: ProfileOpt = None):
     _print(ops.mailpit(_profile(profile)).describe(message_id))
+
+
+# -- vendor fake --
+
+
+@fake_app.command("up")
+def fake_up(path: Annotated[str | None, typer.Option(help="ofapi checkout")] = None):
+    """Start ofapi over TLS (or reuse the running one); prints what clients need."""
+    fake = fakes.ofapi_up(path)
+    _print(
+        {
+            "url": fake.base,
+            "started": fake.started,
+            "ca_bundle": str(fake.cert),
+            "hint": "point the component at https://127.0.0.1:<port>/<vendor> (or "
+            "127.0.0.1:<port>/<vendor> for FQDN settings) and set REQUESTS_CA_BUNDLE=<ca_bundle>",
+        }
+    )
+
+
+@fake_app.command("down")
+def fake_down():
+    _print({"stopped": runner.stop(fakes.OFAPI_RUN)})
+
+
+@fake_app.command("reset")
+def fake_reset():
+    """Forget every scripted rule and the journal."""
+    fakes.Ofapi().reset()
+    _print({"reset": True})
+
+
+@fake_app.command("journal")
+def fake_journal(
+    path: Annotated[str, typer.Option(help="Request path prefix, e.g. /crowdstrike")] = "",
+    limit: int = 20,
+):
+    """What components sent to the fake (method, path, query, body; secrets redacted)."""
+    _print(fakes.Ofapi().journal(path)[-limit:])
 
 
 # -- recipes --

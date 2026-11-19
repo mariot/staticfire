@@ -59,6 +59,8 @@ class Ofapi:
         self.cert = cert
         self.base = f"https://127.0.0.1:{port}"
         self.http = httpx.Client(base_url=self.base, verify=str(cert), timeout=10)
+        # Whether ofapi_up started this instance (a recipe then stops it) or reused one
+        self.started = False
 
     def url(self, path: str) -> str:
         """What a collector needs as its vendor host, e.g. ``127.0.0.1:8443/<vendor>``."""
@@ -108,4 +110,5 @@ def ofapi_up(path: str | None = None, port: int = OFAPI_PORT, timeout: float = 6
     started, _ = wait_until(fake.alive, timeout, 1)
     if not started:
         raise RuntimeError(f"ofapi did not start: {runner.tail(OFAPI_RUN, 30)}")
+    fake.started = True
     return fake

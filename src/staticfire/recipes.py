@@ -258,6 +258,7 @@ def cortex_xdr(
     report = Report(f"cortex-xdr ({verdict})")
     collector = checkout("collectors", "palo-alto-cortex-xdr", collector_path)
     run_name = f"collector-{Path(collector).name}"
+    fake = None
     try:
         fake = fakes.ofapi_up()
         fake.reset()
@@ -346,6 +347,8 @@ def cortex_xdr(
             report.evidence["collector_log"] = _safe_tail(run_name)
         if not keep:
             runner.stop(run_name)
+            if fake and fake.started:
+                runner.stop(fakes.OFAPI_RUN)
     return report
 
 
