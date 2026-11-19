@@ -171,7 +171,16 @@ class OpenCTI:
             {"id": object_id},
         )["stixCoreObject"]
 
-    def create_observable(self, observable_type: str, value: str) -> dict:
+    def label(self, value: str) -> str:
+        """The id of a label (created if needed)."""
+        return self.graphql(
+            "mutation ($input: LabelAddInput!) { labelAdd(input: $input) { id } }",
+            {"input": {"value": value}},
+        )["labelAdd"]["id"]
+
+    def create_observable(
+        self, observable_type: str, value: str, labels: list[str] | None = None
+    ) -> dict:
         key = {
             "IPv4-Addr": "IPv4Addr",
             "IPv6-Addr": "IPv6Addr",
@@ -181,10 +190,11 @@ class OpenCTI:
             "Hostname": "Hostname",
         }[observable_type]
         return self.graphql(
-            f"""mutation ($value: String!) {{
-                  stixCyberObservableAdd(type: "{observable_type}", {key}: {{ value: $value }}) {{
+            f"""mutation ($value: String!, $labels: [String]) {{
+                  stixCyberObservableAdd(type: "{observable_type}", objectLabel: $labels,
+                                         {key}: {{ value: $value }}) {{
                     id standard_id entity_type observable_value }} }}""",
-            {"value": value},
+            {"value": value, "labels": labels or []},
         )["stixCyberObservableAdd"]
 
     def create_file_observable(self, sha256: str, name: str | None = None) -> dict:
@@ -359,7 +369,12 @@ class OpenCTI:
         )["streamCollectionAdd"]["id"]
 
     def create_indicator(
-        self, name: str, pattern: str, main_type: str, pattern_type: str = "stix"
+        self,
+        name: str,
+        pattern: str,
+        main_type: str,
+        pattern_type: str = "stix",
+        labels: list[str] | None = None,
     ) -> dict:
         return self.graphql(
             """mutation ($input: IndicatorAddInput!) { indicatorAdd(input: $input) {
@@ -369,6 +384,7 @@ class OpenCTI:
                     "name": name,
                     "pattern": pattern,
                     "pattern_type": pattern_type,
+                    "objectLabel": labels or [],
                     "x_opencti_main_observable_type": main_type,
                     "x_opencti_score": 80,
                 }

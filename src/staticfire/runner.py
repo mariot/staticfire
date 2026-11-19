@@ -68,7 +68,11 @@ class Component:
 
     @property
     def component_id(self) -> str:
-        return str(uuid.uuid5(ID_NAMESPACE, f"staticfire:{self.kind}:{self.name}"))
+        stable = uuid.uuid5(ID_NAMESPACE, f"staticfire:{self.kind}:{self.name}")
+        if self.kind == "connector":
+            # connectors are documented (and some check) to take a UUIDv4: same id, v4 bits
+            return str(uuid.UUID(int=stable.int, version=4))
+        return str(stable)
 
     @property
     def venv(self) -> Path:
@@ -140,6 +144,18 @@ def _connector(root: Path, connector_type: str) -> Component:
                     entry = m.group(1)
                 workdir = str(root / "src") if (root / "src").is_dir() else str(root)
                 break
+    if script.startswith("/"):
+        # an absolute path in the image (/opt/<...>/src/main.py): the same file in the checkout
+        parts = Path(script).parts[1:]
+        script = next(
+            (
+                str(Path(*parts[i:]))
+                for i in range(len(parts))
+                if (root / Path(*parts[i:])).exists()
+            ),
+            script,
+        )
+        workdir = str(root)
     if script and not (Path(workdir) / script).exists() and (root / script).exists():
         workdir = str(root)
     if not (script or module or entry):
@@ -154,6 +170,11 @@ def _connector(root: Path, connector_type: str) -> Component:
         connector_type=connector_type,
         entry=entry,
     )
+
+
+def _installable(root: Path) -> bool:
+    pyproject = root / "pyproject.toml"
+    return pyproject.exists() and "project" in tomllib.loads(pyproject.read_text())
 
 
 def _console_script(root: Path, name: str) -> str:
@@ -206,7 +227,7 @@ def install(
     if component.kind == "connector":
         requirements = _connector_requirements(root)
         output = _run(["uv", "pip", "install", "--python", str(component.python), *requirements])
-        if (root / "pyproject.toml").exists() and str(root) not in requirements:
+        if _installable(root) and str(root) not in requirements:
             # its dependencies are installed: the connector itself, without them
             output += _run(
                 [
@@ -285,7 +306,8 @@ def _connector_requirements(root: Path) -> list[str]:
         else:
             requirements += ["-r", str(candidate)]
     pyproject = root / "pyproject.toml"
-    if pyproject.exists():
+    # a pyproject may only configure tools (pytest...): only a [project] is installable
+    if pyproject.exists() and "project" in tomllib.loads(pyproject.read_text()):
         dependencies = (
             tomllib.loads(pyproject.read_text()).get("project", {}).get("dependencies", [])
         )
