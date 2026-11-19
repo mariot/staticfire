@@ -277,7 +277,7 @@ EMAIL_M365 = VendorInjector(
     message="Email accepted by Microsoft Graph",
     calls=[
         ("POST", f"/microsoft-identity/{M365_TENANT}/oauth2/v2.0/token"),
-        ("POST", "/microsoft-graph/v1.0/users/sender%40staticfire.test/sendMail"),
+        ("POST", "/microsoft-graph/v1.0/users/sender@staticfire.test/sendMail"),
     ],
     description="client-credentials login (MSAL, test-side discovery patch), then sendMail",
 )

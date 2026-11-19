@@ -394,6 +394,31 @@ def fire(
     raise typer.Exit(0 if result.verdict == "PASS" else 1)
 
 
+@app.command("matrix")
+def matrix_cmd(
+    names: Annotated[list[str] | None, typer.Argument(help="Recipes (default: all)")] = None,
+    all_verdicts: Annotated[bool, typer.Option(help="Run every verdict of each recipe")] = False,
+    out: Annotated[str | None, typer.Option(help="Directory for the JSON reports")] = None,
+    profile: ProfileOpt = None,
+):
+    """Run several recipes one after the other and print a summary table."""
+    unknown = [n for n in names or [] if n not in recipes.RECIPES]
+    if unknown:
+        raise typer.BadParameter(f"Unknown recipes {unknown}")
+
+    def show(row: dict) -> None:
+        detail = row["error"] or ", ".join(row["failed"])
+        typer.echo(
+            f"{row['result']:5} {row['recipe']:24} {row['verdict']:10} "
+            f"{row['duration_s']:6.1f}s {detail}"
+        )
+
+    rows = recipes.matrix(_profile(profile), names, all_verdicts, Path(out) if out else None, show)
+    passed = sum(r["result"] == "PASS" for r in rows)
+    typer.echo(f"{passed}/{len(rows)} passed")
+    raise typer.Exit(0 if passed == len(rows) else 1)
+
+
 def main() -> None:
     try:
         app()

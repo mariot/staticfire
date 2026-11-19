@@ -7,6 +7,7 @@ they need from their checkouts and stop them afterwards unless ``keep`` is set.
 from __future__ import annotations
 
 import functools
+import json
 import os
 import re
 import time
@@ -745,3 +746,45 @@ DESCRIPTIONS = {
         for name, spec in ai_vendors.SPECS.items()
     },
 }
+
+
+def verdicts_of(name: str) -> list[str | None]:
+    """The verdicts a recipe can be run with ([None] when it takes none)."""
+    if name in vendors.SPECS:
+        return vendors.SPECS[name].verdicts
+    if name in ai_vendors.SPECS:
+        return ai_vendors.SPECS[name].verdicts
+    return [None]
+
+
+def matrix(
+    profile: Profile,
+    names: list[str] | None = None,
+    all_verdicts: bool = False,
+    out_dir: Path | None = None,
+    progress: Callable[[dict], None] | None = None,
+) -> list[dict]:
+    """Run recipes one after the other (they share the platform and the fake)."""
+    rows = []
+    for name in names or list(RECIPES):
+        for verdict in verdicts_of(name) if all_verdicts else [None]:
+            fn = RECIPES[name]
+            kwargs = {"verdict": verdict} if verdict else {}
+            report = fn(profile, **kwargs)
+            row = {
+                "recipe": name,
+                "verdict": verdict or "",
+                "result": report.verdict,
+                "duration_s": report.to_dict()["duration_s"],
+                "failed": [c.name for c in report.checks if not c.ok],
+                "error": report.error,
+            }
+            if out_dir:
+                out_dir.mkdir(parents=True, exist_ok=True)
+                target = out_dir / f"{name}{'-' + verdict if verdict else ''}.json"
+                target.write_text(json.dumps(report.to_dict(), indent=2, default=str))
+                row["report"] = str(target)
+            rows.append(row)
+            if progress:
+                progress(row)
+    return rows
