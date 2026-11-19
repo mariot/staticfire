@@ -319,9 +319,20 @@ CROWDSTRIKE_ENTITIES = "/crowdstrike/alerts/entities/alerts/v2"
 CROWDSTRIKE_BLOCKED = 2048
 
 
+def _crowdstrike_meta(total: int) -> dict:
+    # falconpy hands back an empty body when the API's meta is empty: always send a real one
+    return {
+        "query_time": 0.01,
+        "pagination": {"offset": 0, "limit": 100, "total": total},
+        "powered_by": "detectsapi",
+        "trace_id": "staticfire",
+    }
+
+
 def _crowdstrike_rules(s: Signals, verdict: str) -> list[Rule]:
     if verdict == "none":
-        return [Rule(CROWDSTRIKE_QUERY, {"errors": [], "meta": {}, "resources": []}, method="GET")]
+        body = {"errors": [], "meta": _crowdstrike_meta(0), "resources": []}
+        return [Rule(CROWDSTRIKE_QUERY, body, method="GET")]
     alert_id = "staticfire-1"
     entity = {
         "id": alert_id,
@@ -338,11 +349,13 @@ def _crowdstrike_rules(s: Signals, verdict: str) -> list[Rule]:
     return [
         Rule(
             CROWDSTRIKE_QUERY,
-            {"errors": [], "meta": {}, "resources": [entity["composite_id"]]},
+            {"errors": [], "meta": _crowdstrike_meta(1), "resources": [entity["composite_id"]]},
             method="GET",
         ),
         Rule(
-            CROWDSTRIKE_ENTITIES, {"errors": [], "meta": {}, "resources": [entity]}, method="POST"
+            CROWDSTRIKE_ENTITIES,
+            {"errors": [], "meta": _crowdstrike_meta(1), "resources": [entity]},
+            method="POST",
         ),
     ]
 
