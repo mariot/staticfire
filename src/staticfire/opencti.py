@@ -197,6 +197,38 @@ class OpenCTI:
             {"value": value, "labels": labels or []},
         )["stixCyberObservableAdd"]
 
+    def create_artifact(
+        self,
+        content: bytes,
+        file_name: str = "sample.exe",
+        mime: str = "application/x-dosexec",
+    ) -> str:
+        """An Artifact carrying ``content``, attached as a file as a user uploading it would:
+        OpenCTI only stores a payload when an enrichment is asked, too late for the connector."""
+        import base64
+        import hashlib
+
+        artifact = self.graphql(
+            """mutation ($payload: String!, $sha256: String!, $mime: String, $name: String!) {
+                 stixCyberObservableAdd(type: "Artifact",
+                   Artifact: { payload_bin: $payload, mime_type: $mime,
+                               hashes: [{ algorithm: "SHA-256", hash: $sha256 }],
+                               x_opencti_additional_names: [$name] }) { id } }""",
+            {
+                "payload": base64.b64encode(content).decode(),
+                "sha256": hashlib.sha256(content).hexdigest(),
+                "mime": mime,
+                "name": file_name,
+            },
+        )["stixCyberObservableAdd"]["id"]
+        self._upload(
+            "mutation ($id: ID!, $file: Upload!) {"
+            " stixCoreObjectEdit(id: $id) { importPush(file: $file) { id } } }",
+            {"id": artifact},
+            (file_name, content, mime),
+        )
+        return artifact
+
     def create_file_observable(self, sha256: str, name: str | None = None) -> dict:
         return self.graphql(
             """mutation ($sha256: String!, $name: String) {
@@ -214,12 +246,9 @@ class OpenCTI:
             {"id": object_id, "connectorId": connector_id},
         )["stixCoreObjectEdit"]["askEnrichment"]
 
-    def upload_import(self, file_name: str, content: bytes, mime: str) -> dict:
-        """Upload a global import file, without triggering any import; the File (id, name)."""
-        operations = {
-            "query": "mutation ($file: Upload!) { uploadImport(file: $file) { id name } }",
-            "variables": {"file": None},
-        }
+    def _upload(self, query: str, variables: dict, file: tuple[str, bytes, str]) -> dict:
+        """A GraphQL multipart upload (``$file`` in ``query``)."""
+        operations = {"query": query, "variables": {**variables, "file": None}}
         self.http.cookies.clear()
         # Built apart from the client: its JSON content type would replace the multipart one
         request = httpx.Request(
@@ -233,7 +262,7 @@ class OpenCTI:
                 "operations": json.dumps(operations),
                 "map": json.dumps({"0": ["variables.file"]}),
             },
-            files={"0": (file_name, content, mime)},
+            files={"0": file},
         )
         response = self.http.send(request)
         if response.status_code >= 400:
@@ -241,7 +270,15 @@ class OpenCTI:
         payload = response.json()
         if payload.get("errors"):
             raise OpenCTIError(f"upload errors: {payload['errors'][:3]}")
-        return payload["data"]["uploadImport"]
+        return payload["data"]
+
+    def upload_import(self, file_name: str, content: bytes, mime: str) -> dict:
+        """Upload a global import file, without triggering any import; the File (id, name)."""
+        return self._upload(
+            "mutation ($file: Upload!) { uploadImport(file: $file) { id name } }",
+            {},
+            (file_name, content, mime),
+        )["uploadImport"]
 
     def ask_import(self, file_id: str, connector_id: str) -> dict:
         """Have one import connector process an uploaded file, straight into the knowledge."""
