@@ -48,6 +48,14 @@ def checkout(repo: str, name: str, path: str | None = None) -> str:
     )
 
 
+def _clock_ok(report: Report, profile: Profile) -> bool:
+    """Collectors judge expectations by age: refuse to run on a platform with a wrong clock."""
+    problem = ops.clock_problem(profile)
+    if problem:
+        report.error = problem
+    return problem is None
+
+
 def _start(report: Report, profile: Profile, path: str, label: str, **kwargs) -> dict | None:
     up = ops.component_up(profile, path, **kwargs)
     report.refs[f"{label}_log"] = up["run"]["log"]
@@ -273,6 +281,8 @@ def mailpit_collector(
     collector = collector_path or str(MAILPIT_COLLECTOR)
     runs = ["injector-email-smtp", f"collector-{Path(collector).name}"]
     try:
+        if not _clock_ok(report, profile):
+            return report
         endpoint = ops.agent_endpoint(profile, asset_id)
         report.refs["endpoint"] = f"{endpoint['name']} ({endpoint['asset_id']})"
         injector_up = _start(report, profile, injector, "injector")
@@ -356,6 +366,8 @@ def vendor_collector(
     run_name = f"collector-{Path(collector).name}"
     fake = None
     try:
+        if not _clock_ok(report, profile):
+            return report
         fake = fakes.ofapi_up()
         fake.reset()
         report.refs["vendor_fake"] = f"{fake.http_base} / {fake.base}"
@@ -529,6 +541,8 @@ def catalog_collector(
     run_name = f"collector-{Path(collector).name}"
     fake = None
     try:
+        if not _clock_ok(report, profile):
+            return report
         fake = fakes.ofapi_up()
         fake.reset()
         up = _start(report, profile, collector, "collector", kind="collector", env=spec.env(fake))
@@ -609,6 +623,8 @@ def ai_collector(
     runs = ["injector-ai-redteam", f"collector-{Path(collector).name}"]
     fake = None
     try:
+        if not _clock_ok(report, profile):
+            return report
         fake = fakes.ofapi_up()
         fake.reset()
         if not _start(report, profile, injector, "injector"):
@@ -716,6 +732,10 @@ RECIPES: dict[str, Callable[..., Report]] = {
     "mailpit-collector": mailpit_collector,
     **{name: functools.partial(vendor_collector, spec_name=name) for name in vendors.SPECS},
     **{name: functools.partial(vendor_injector, spec_name=name) for name in injector_vendors.SPECS},
+    **{
+        name: functools.partial(catalog_collector, spec_name=name) for name in catalog_vendors.SPECS
+    },
+    **{name: functools.partial(ai_collector, spec_name=name) for name in ai_vendors.SPECS},
 }
 
 DESCRIPTIONS = {

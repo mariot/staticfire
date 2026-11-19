@@ -131,3 +131,10 @@ def test_required_python_never_goes_below_312(tmp_path):
     assert runner._required_python(root) == (3, 12)
     (root / "pyproject.toml").write_text('[project]\nname = "x"\nrequires-python = ">=3.14"\n')
     assert runner._required_python(root) == (3, 14)
+
+
+def test_every_recipe_has_a_description_and_back():
+    from staticfire import recipes
+
+    assert set(recipes.RECIPES) == set(recipes.DESCRIPTIONS)
+    assert len(recipes.RECIPES) >= 30

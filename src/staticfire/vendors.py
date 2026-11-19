@@ -355,6 +355,8 @@ CROWDSTRIKE = VendorCollector(
         "CROWDSTRIKE_UI_BASE_URL": "https://falcon.example",
         "CROWDSTRIKE_CLIENT_ID": "staticfire-client",
         "CROWDSTRIKE_CLIENT_SECRET": "staticfire-fake-secret",
+        # Required by its settings, although its README documents a default
+        "COLLECTOR_NAME": "CrowdStrike Endpoint Security",
     },
     rules=_crowdstrike_rules,
     # A matching alert that did not block it is reported as such, not left pending

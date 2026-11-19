@@ -63,6 +63,24 @@ def ui_link(profile: Profile, kind: str, entity_id: str) -> str:
 # -- platform --
 
 
+# Collectors age expectations by their creation date: a platform clock off by more than this
+# makes fresh expectations look expired (or not yet started)
+MAX_CLOCK_SKEW = 120
+
+
+def clock_problem(profile: Profile) -> str | None:
+    """Why the platform clock cannot be trusted for collector tests, if it cannot."""
+    skew = client(profile).clock_skew()
+    if abs(skew) <= MAX_CLOCK_SKEW:
+        return None
+    fix = (
+        f"multipass exec {profile.multipass_vm} -- sudo chronyc makestep"
+        if profile.multipass_vm
+        else "resynchronise the platform host's clock (chronyc makestep)"
+    )
+    return f"platform clock is {skew:+.0f}s off this machine's: {fix}"
+
+
 def status(profile: Profile) -> dict:
     api = client(profile)
     settings = api.settings()
@@ -71,6 +89,8 @@ def status(profile: Profile) -> dict:
         "platform": {
             "version": settings.get("platform_version"),
             "base_url": settings.get("platform_base_url"),
+            "clock_skew_s": round(api.clock_skew(), 1),
+            "clock_problem": clock_problem(profile),
         },
         "injectors": [
             {

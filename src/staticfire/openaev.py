@@ -9,6 +9,8 @@ from __future__ import annotations
 import json
 import time
 from collections.abc import Callable
+from datetime import UTC, datetime
+from email.utils import parsedate_to_datetime
 from typing import Any
 
 import httpx
@@ -72,6 +74,13 @@ class OpenAEV:
         return self.request("DELETE", path)
 
     # -- platform --
+
+    def clock_skew(self) -> float:
+        """Platform clock minus local clock, in seconds (from the HTTP Date header)."""
+        self.http.cookies.clear()
+        response = self.http.get("/api/settings")
+        server = parsedate_to_datetime(response.headers["date"])
+        return (server - datetime.now(UTC)).total_seconds()
 
     def settings(self) -> dict:
         return self.get("/api/settings")
