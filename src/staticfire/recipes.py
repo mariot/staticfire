@@ -8,12 +8,21 @@ from __future__ import annotations
 
 import functools
 import os
+import re
 import time
 import uuid
 from collections.abc import Callable
 from pathlib import Path
 
-from staticfire import fakes, ops, runner, vendors
+from staticfire import (
+    ai_vendors,
+    catalog_vendors,
+    fakes,
+    injector_vendors,
+    ops,
+    runner,
+    vendors,
+)
 from staticfire.config import Profile
 from staticfire.openaev import wait_until
 from staticfire.report import Report
@@ -422,6 +431,278 @@ def vendor_collector(
     return report
 
 
+def vendor_injector(
+    profile: Profile,
+    spec_name: str,
+    injector_path: str | None = None,
+    pyoaev: str | None = None,
+    keep: bool = False,
+    timeout: float = 180,
+) -> Report:
+    """Injector test: fire an injector at a fake vendor or a stubbed tool (see injector_vendors).
+
+    Checks the inject status, the injector's completion message, the findings the platform
+    created from its outputs and the calls the fake received.
+    """
+    spec = injector_vendors.SPECS[spec_name]
+    report = Report(spec.recipe)
+    injector = checkout("injectors", spec.injector, injector_path)
+    run_name = f"injector-{Path(injector).name}"
+    fake = None
+    try:
+        fake = fakes.ofapi_up()
+        fake.reset()
+        stub_dir = injector_vendors.write_stubs(spec)
+        endpoint = ops.agent_endpoint(profile) if spec.target_endpoint else None
+        ctx = injector_vendors.Context(fake, uuid.uuid4().hex[:10], stub_dir, endpoint)
+        for rule in spec.rules(ctx):
+            fake.rule(rule.path, [rule.response()], method=rule.method)
+        env = spec.env(ctx)
+        if any(name != "sitecustomize.py" for name in spec.stubs):
+            env.setdefault("PATH", f"{stub_dir}:{os.environ.get('PATH', '')}")
+        up = _start(report, profile, injector, "injector", env=env, pyoaev=pyoaev)
+        if not up:
+            return report
+        contract_ids = [c["contract_id"] for c in up["contracts"]]
+        if not report.check(f"contract {spec.contract} registered", spec.contract in contract_ids):
+            return report
+        assets = [endpoint["asset_id"]] if endpoint else []
+        result = ops.run_inject(
+            profile,
+            spec.contract,
+            spec.content(ctx),
+            assets=assets,
+            expectations=spec.expectations or None,
+            title=f"staticfire {spec.recipe} {ctx.token}",
+            timeout=timeout,
+        )
+        report.refs["inject_id"] = result["inject_id"]
+        report.refs["inject"] = result["link"]
+        report.evidence["traces"] = result["traces"]
+        report.check(
+            f"inject status {spec.status}", result["status"] == spec.status, result["status"]
+        )
+        complete = [t["message"] or "" for t in result["traces"] if t["action"] == "COMPLETE"]
+        if spec.message:
+            report.check(
+                f"completion message matches {spec.message!r}",
+                any(re.search(spec.message, m) for m in complete),
+                complete,
+            )
+        if spec.findings:
+            findings = ops.inject_findings(profile, result["inject_id"])
+            report.evidence["findings"] = findings
+            for kind, value in spec.findings:
+                report.check(
+                    f"finding {kind} containing {value!r}",
+                    any(f["type"] == kind and value in (f["value"] or "") for f in findings),
+                    [f"{f['type']}: {f['value']}" for f in findings][:20],
+                )
+        for method, path in spec.calls:
+            calls = [c for c in fake.journal(path) if c.get("method") == method]
+            report.evidence.setdefault("vendor_calls", {})[path] = calls[:2]
+            report.check(f"injector called {method} {path}", calls, "no call recorded")
+    except Exception as err:
+        report.error = f"{type(err).__name__}: {err}"
+    finally:
+        if report.verdict != "PASS":
+            report.evidence["injector_log"] = _safe_tail(run_name)
+        if not keep:
+            runner.stop(run_name)
+            if fake and fake.started:
+                runner.stop(fakes.OFAPI_RUN)
+    return report
+
+
+def catalog_collector(
+    profile: Profile,
+    spec_name: str,
+    collector_path: str | None = None,
+    keep: bool = False,
+    timeout: float | None = None,
+) -> Report:
+    """Catalog/asset collector test: import a fake dataset, check what the platform holds."""
+    spec = catalog_vendors.SPECS[spec_name]
+    report = Report(spec.recipe)
+    collector = checkout("collectors", spec.collector, collector_path)
+    run_name = f"collector-{Path(collector).name}"
+    fake = None
+    try:
+        fake = fakes.ofapi_up()
+        fake.reset()
+        up = _start(report, profile, collector, "collector", kind="collector", env=spec.env(fake))
+        if not up:
+            return report
+        collector_id = up["component"]["id"]
+        api = ops.client(profile)
+        last: list = []
+
+        def settled() -> bool:
+            nonlocal last
+            last = spec.checks(api, collector_id)
+            return all(ok for _, ok, _ in last)
+
+        wait_until(settled, timeout or spec.timeout, 10)
+        for name, ok, detail in last:
+            report.check(name, ok, detail)
+        for path in spec.calls:
+            calls = fake.journal(path)
+            report.evidence.setdefault("source_calls", {})[path] = calls[:2]
+            report.check(f"collector fetched {path}", calls, "no call recorded")
+    except Exception as err:
+        report.error = f"{type(err).__name__}: {err}"
+    finally:
+        if report.verdict != "PASS":
+            report.evidence["collector_log"] = _safe_tail(run_name)
+        if not keep:
+            runner.stop(run_name)
+            if fake and fake.started:
+                runner.stop(fakes.OFAPI_RUN)
+    return report
+
+
+AI_TARGET_NAME = "staticfire AI target (ofapi)"
+
+
+def _ai_target(profile: Profile, fake) -> str:
+    """The AI target pointing at the fake OpenAI-compatible model, created once."""
+    api = ops.client(profile)
+    found = api.post(
+        "/api/ai_targets/search", {"page": 0, "size": 20, "textSearch": AI_TARGET_NAME}
+    )
+    for target in (found or {}).get("content", []):
+        if target.get("asset_name") == AI_TARGET_NAME:
+            return target["asset_id"]
+    created = api.post(
+        "/api/ai_targets",
+        {
+            "asset_name": AI_TARGET_NAME,
+            "ai_target_provider": "OPENAI_COMPATIBLE",
+            "ai_target_endpoint": fake.http_url("openai/v1"),
+            "ai_target_model": "gpt-4o-mini",
+            "ai_target_modality": "TEXT",
+            "ai_target_token": "staticfire-fake-token",
+        },
+    )
+    return created["asset_id"]
+
+
+def ai_collector(
+    profile: Profile,
+    spec_name: str,
+    verdict: str | None = None,
+    injector_path: str | None = None,
+    collector_path: str | None = None,
+    keep: bool = False,
+    timeout: float = 240,
+) -> Report:
+    """AI defense test: ai-redteam attacks a fake model, an AI firewall collector judges it."""
+    spec = ai_vendors.SPECS[spec_name]
+    verdict = verdict or spec.verdicts[0]
+    if verdict not in spec.expected:
+        raise ValueError(f"{spec.recipe} supports verdicts {spec.verdicts}")
+    expected = spec.expected[verdict]
+    report = Report(f"{spec.recipe} ({verdict})")
+    injector = checkout("injectors", "ai-redteam", injector_path)
+    collector = checkout("collectors", spec.collector, collector_path)
+    runs = ["injector-ai-redteam", f"collector-{Path(collector).name}"]
+    fake = None
+    try:
+        fake = fakes.ofapi_up()
+        fake.reset()
+        if not _start(report, profile, injector, "injector"):
+            return report
+        # The collector registers its security platform: it must exist before the launch
+        up = _start(
+            report,
+            profile,
+            collector,
+            "collector",
+            kind="collector",
+            env={
+                **spec.env(fake),
+                "COLLECTOR_PLATFORM": spec.platform,
+                "COLLECTOR_PERIOD": "PT10S",
+            },
+        )
+        if not up:
+            return report
+        collector_id = up["component"]["id"]
+        target = _ai_target(profile, fake)
+        report.refs["ai_target"] = target
+        expectations = [
+            {
+                **e,
+                "expectation_expected_security_platform_types": ai_vendors.FIREWALL_PLATFORMS,
+            }
+            for e in ops.expectation_content(ops.TECHNICAL_EXPECTATIONS)
+        ]
+        created = ops.run_inject(
+            profile,
+            ai_vendors.AI_REDTEAM_DIRECT_INJECTION,
+            {
+                "target_selector": "ai_target",
+                "ai_target": target,
+                "attack_prompt": ai_vendors.ATTACK_PROMPT,
+                "converters": "none",
+                "expectations": expectations,
+            },
+            title=f"staticfire {spec.recipe} {verdict}",
+            launch=False,
+        )
+        inject_id = created["inject_id"]
+        for rule in spec.rules(inject_id, verdict):
+            fake.rule(rule.path, [rule.response()], method=rule.method)
+        result = ops.launch_and_wait(profile, inject_id, timeout=timeout)
+        report.refs["inject_id"] = inject_id
+        report.refs["inject"] = result["link"]
+        report.evidence["traces"] = result["traces"]
+        report.check("inject status EXECUTED", result["status"] == "EXECUTED", result["status"])
+        complete = [t["message"] or "" for t in result["traces"] if t["action"] == "COMPLETE"]
+        report.check(
+            "model refused the attack (DEFENDED)", any("DEFENDED" in m for m in complete), complete
+        )
+        model_calls = fake.journal("/openai/v1/chat/completions")
+        report.check("ai-redteam attacked the fake model", model_calls, "no call recorded")
+        answered_types = tuple(t for t, r in expected.items() if r)
+        if answered_types:
+            done, results = ops.wait_expectations(
+                profile, inject_id, target, collector_id, answered_types, timeout
+            )
+            report.check(f"collector answers {', '.join(answered_types)} in time", done)
+        else:
+            wait_until(lambda: False, 45, 5)
+            results = ops.expectations_of_target(ops.client(profile), inject_id, target)
+        report.evidence["expectations"] = results
+        for kind, wanted in expected.items():
+            mine = [
+                r["result"]
+                for e in results
+                if e["type"] == kind
+                for r in e["results"]
+                if r["source_id"] == collector_id and r["result"]
+            ]
+            if wanted:
+                report.check(f"{kind} answered '{wanted}' by the collector", mine == [wanted], mine)
+            else:
+                report.check(f"{kind} left unanswered by the collector", not mine, mine)
+        for path in spec.calls:
+            calls = fake.journal(path)
+            report.evidence.setdefault("vendor_calls", {})[path] = calls[:2]
+            report.check(f"collector called {path}", calls, "no call recorded")
+    except Exception as err:
+        report.error = f"{type(err).__name__}: {err}"
+    finally:
+        if report.verdict != "PASS":
+            report.evidence["logs"] = {name: _safe_tail(name) for name in runs}
+        if not keep:
+            for name in runs:
+                runner.stop(name)
+            if fake and fake.started:
+                runner.stop(fakes.OFAPI_RUN)
+    return report
+
+
 def _safe_tail(run_name: str) -> str | None:
     try:
         return runner.tail(run_name, 40)
@@ -433,6 +714,7 @@ RECIPES: dict[str, Callable[..., Report]] = {
     "email-smtp": email_smtp,
     "mailpit-collector": mailpit_collector,
     **{name: functools.partial(vendor_collector, spec_name=name) for name in vendors.SPECS},
+    **{name: functools.partial(vendor_injector, spec_name=name) for name in injector_vendors.SPECS},
 }
 
 DESCRIPTIONS = {
@@ -447,5 +729,19 @@ DESCRIPTIONS = {
         f"{spec.collector} ({spec.description}); the collector must answer OpenAEV. Option "
         f"verdict: {', '.join(spec.verdicts)}."
         for name, spec in vendors.SPECS.items()
+    },
+    **{
+        name: f"Injector test: {spec.injector} ({spec.description})."
+        for name, spec in injector_vendors.SPECS.items()
+    },
+    **{
+        name: f"Collector test: {spec.collector} imports ofapi's dataset ({spec.description}); "
+        "the platform must hold what it implies and nothing it excludes."
+        for name, spec in catalog_vendors.SPECS.items()
+    },
+    **{
+        name: f"AI defense test: ai-redteam attacks ofapi's model, {spec.collector} judges it "
+        f"({spec.description}). Option verdict: {', '.join(spec.verdicts)}."
+        for name, spec in ai_vendors.SPECS.items()
     },
 }

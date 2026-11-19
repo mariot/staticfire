@@ -441,6 +441,24 @@ def expectations_of_target(api: OpenAEV, inject_id: str, asset_id: str) -> list[
     ]
 
 
+def inject_findings(profile: Profile, inject_id: str) -> list[dict]:
+    """Findings the platform created from the inject's structured outputs."""
+    page = client(profile).post(
+        f"/api/findings/injects/{inject_id}/search", {"page": 0, "size": 100}
+    )
+    return [
+        {
+            "type": f.get("finding_type"),
+            "field": f.get("finding_field"),
+            "value": f.get("finding_value"),
+            "assets": [
+                a.get("asset_id") for a in f.get("finding_assets") or [] if isinstance(a, dict)
+            ],
+        }
+        for f in (page or {}).get("content", [])
+    ]
+
+
 def pending_expectations(profile: Profile, inject_id: str | None = None) -> list[dict]:
     """Agent expectations not answered yet, as a collector polling OpenAEV receives them.
 
