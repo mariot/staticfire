@@ -158,7 +158,12 @@ class Proxy:
 
         cert, _ = tls_files()
         parts = [Path(certifi.where()).read_text(), self.ca.read_text(), cert.read_text()]
-        self.bundle.write_text("\n".join(parts))
+        content = "\n".join(parts)
+        if not self.bundle.exists() or self.bundle.read_text() != content:
+            # atomically: running connectors read it on every new TLS connection
+            temporary = self.bundle.with_suffix(f".{os.getpid()}.tmp")
+            temporary.write_text(content)
+            os.replace(temporary, self.bundle)
         return self.bundle
 
     def trust_env(self) -> dict[str, str]:

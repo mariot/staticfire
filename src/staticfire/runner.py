@@ -53,9 +53,13 @@ class Component:
     script: str = ""
     workdir: str = ""
     connector_type: str = ""
+    # Or a console script of its pyproject, run from the venv
+    entry: str = ""
 
     @property
     def argv_tail(self) -> list[str]:
+        if self.entry:
+            return [str(self.venv / "bin" / self.entry)]
         return [self.script] if self.script else ["-m", self.module]
 
     @property
@@ -103,7 +107,7 @@ def _connector(root: Path, connector_type: str) -> Component:
     src = root / "src"
     entrypoint = root / "entrypoint.sh"
     dockerfile = root / "Dockerfile"
-    script, module, workdir = "", "", str(src if src.is_dir() else root)
+    script, module, entry, workdir = "", "", "", str(src if src.is_dir() else root)
     if entrypoint.exists() and (
         m := re.findall(r"python3?\s+(?:-m\s+)?(\S+)", entrypoint.read_text())
     ):
@@ -123,8 +127,22 @@ def _connector(root: Path, connector_type: str) -> Component:
                 break
             if m := re.search(r'"python3?",\s*"([^"]+\.py)"', line):
                 script = m.group(1)
+                if script.startswith("/opt/"):
+                    # the image copies src/ (or the connector) to /opt: run the checkout's file
+                    script = Path(script).name
                 break
-    if not (script or module):
+            if m := re.search(r'\[\s*"([\w.-]+)"', line):
+                # a console script installed from the connector's pyproject
+                target = _console_script(root, m.group(1))
+                if target.split(":")[0].endswith(".__main__"):
+                    module = target.split(":")[0].removesuffix(".__main__")
+                elif target:
+                    entry = m.group(1)
+                workdir = str(root / "src") if (root / "src").is_dir() else str(root)
+                break
+    if script and not (Path(workdir) / script).exists() and (root / script).exists():
+        workdir = str(root)
+    if not (script or module or entry):
         raise RunnerError(f"No entry point found in {root} (entrypoint.sh or Dockerfile CMD)")
     return Component(
         kind="connector",
@@ -134,7 +152,17 @@ def _connector(root: Path, connector_type: str) -> Component:
         script=script,
         workdir=workdir,
         connector_type=connector_type,
+        entry=entry,
     )
+
+
+def _console_script(root: Path, name: str) -> str:
+    """The "module:function" of a console script declared in the pyproject, or ""."""
+    pyproject = root / "pyproject.toml"
+    if not pyproject.exists():
+        return ""
+    scripts = tomllib.loads(pyproject.read_text()).get("project", {}).get("scripts", {})
+    return scripts.get(name, "")
 
 
 def _module(root: Path) -> str:

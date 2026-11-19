@@ -105,8 +105,9 @@ def compose_defaults(connector_dir: Path) -> dict[str, str]:
             value = "" if value is None else str(value)
             if isinstance(environment.get(name), bool):
                 value = value.lower()
-            if substitution := re.fullmatch(r"\$\{\w+(?::?-(.*))?\}", value):
-                value = substitution.group(1) or ""  # ${VAR:-default}: the default, else none
+            # ${VAR:-default}: the default (itself maybe ${OTHER:-...}), ${VAR}: none
+            while substitution := re.fullmatch(r"\$\{\w+(?::?-(.*))?\}", value):
+                value = substitution.group(1) or ""
             if name.startswith(SKIPPED_DEFAULTS) or not value or "changeme" in value.lower():
                 continue
             defaults[name] = value
@@ -139,12 +140,22 @@ def schema_placeholders(connector_dir: Path, provided: dict[str, str]) -> dict[s
     return placeholders
 
 
+# spec module -> why it could not be imported
+BROKEN: dict[str, str] = {}
+
+
 def _discover() -> dict[str, ConnectorSpec]:
     from staticfire import connectors
 
     specs: dict[str, ConnectorSpec] = {}
     for info in sorted(pkgutil.iter_modules(connectors.__path__), key=lambda m: m.name):
-        module = importlib.import_module(f"{connectors.__name__}.{info.name}")
+        if info.name.startswith("_"):
+            continue
+        try:
+            module = importlib.import_module(f"{connectors.__name__}.{info.name}")
+        except Exception as err:  # one broken spec must not hide the others
+            BROKEN[info.name] = f"{type(err).__name__}: {err}"
+            continue
         found = getattr(module, "SPECS", None) or [getattr(module, "SPEC", None)]
         for spec in filter(None, found):
             if spec.recipe in specs:
