@@ -44,6 +44,8 @@ class AiCollector:
     calls: list[str]
     expected: dict[str, dict[str, str | None]] = field(default_factory=lambda: FIREWALL)
     platform: str = "LLM_FIREWALL"
+    # Send its HTTP(S) through the proxy to ofapi (hardcoded vendor hosts, SDKs)
+    proxy: bool = False
     description: str = ""
 
     @property

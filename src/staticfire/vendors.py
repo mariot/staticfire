@@ -90,6 +90,8 @@ class VendorCollector:
     # Path prefixes the collector must have called on the fake
     calls: list[str] = field(default_factory=list)
     period: str = "PT15S"
+    # Send its HTTP(S) through the proxy to ofapi (hardcoded vendor hosts, SDKs)
+    proxy: bool = False
     description: str = ""
 
     @property

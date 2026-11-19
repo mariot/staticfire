@@ -407,7 +407,11 @@ def vendor_collector(
             collector,
             "collector",
             kind="collector",
-            env={**spec.env(fake), "COLLECTOR_PERIOD": spec.period},
+            env={
+                **(fakes.component_proxy_env(fake, profile.host) if spec.proxy else {}),
+                **spec.env(fake),
+                "COLLECTOR_PERIOD": spec.period,
+            },
         )
         if not up:
             return report
@@ -479,7 +483,10 @@ def vendor_injector(
         ctx = injector_vendors.Context(fake, uuid.uuid4().hex[:10], stub_dir, endpoint)
         for rule in spec.rules(ctx):
             fake.rule(rule.path, [rule.response()], method=rule.method)
-        env = spec.env(ctx)
+        env = {
+            **(fakes.component_proxy_env(fake, profile.host) if spec.proxy else {}),
+            **spec.env(ctx),
+        }
         if any(name != "sitecustomize.py" for name in spec.stubs):
             env.setdefault("PATH", f"{stub_dir}:{os.environ.get('PATH', '')}")
         up = _start(report, profile, injector, "injector", env=env, pyoaev=pyoaev)
@@ -554,7 +561,11 @@ def catalog_collector(
             return report
         fake = fakes.ofapi_up()
         fake.reset()
-        up = _start(report, profile, collector, "collector", kind="collector", env=spec.env(fake))
+        env = {
+            **(fakes.component_proxy_env(fake, profile.host) if spec.proxy else {}),
+            **spec.env(fake),
+        }
+        up = _start(report, profile, collector, "collector", kind="collector", env=env)
         if not up:
             return report
         collector_id = up["component"]["id"]
@@ -650,6 +661,7 @@ def ai_collector(
             "collector",
             kind="collector",
             env={
+                **(fakes.component_proxy_env(fake, profile.host) if spec.proxy else {}),
                 **spec.env(fake),
                 "COLLECTOR_PLATFORM": spec.platform,
                 "COLLECTOR_PERIOD": "PT10S",

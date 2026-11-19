@@ -238,3 +238,12 @@ def proxy_up(fake: Ofapi, port: int = PROXY_PORT, timeout: float = 60) -> Proxy:
         raise RuntimeError(f"the proxy did not start: {runner.tail(PROXY_RUN, 30)}")
     proxy.write_bundle()
     return proxy
+
+
+def component_proxy_env(fake: Ofapi, profile_host: str | None) -> dict[str, str]:
+    """Everything a component needs to reach the fakes through the proxy, whatever its vendor
+    URL: proxy variables (the platform bypassed), trusted certificates, the shims."""
+    from staticfire import shims
+
+    proxy = proxy_up(fake)
+    return {**proxy.env([profile_host or ""]), **shims.env()}

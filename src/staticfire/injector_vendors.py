@@ -56,6 +56,8 @@ class VendorInjector:
     findings: list[tuple[str, str]] = field(default_factory=list)
     # (method, path prefix) the injector must have called on the fake
     calls: list[tuple[str, str]] = field(default_factory=list)
+    # Send its HTTP(S) through the proxy to ofapi (hardcoded vendor hosts, SDKs)
+    proxy: bool = False
     description: str = ""
 
 

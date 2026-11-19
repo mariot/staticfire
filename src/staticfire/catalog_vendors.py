@@ -25,6 +25,8 @@ class CatalogCollector:
     # Source paths the collector must have fetched from the fake
     calls: list[str]
     timeout: float = 240
+    # Send its HTTP(S) through the proxy to ofapi (hardcoded vendor hosts, SDKs)
+    proxy: bool = False
     description: str = ""
 
 
