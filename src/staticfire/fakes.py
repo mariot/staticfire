@@ -96,6 +96,19 @@ class Ofapi:
         """Load the vendor modules added or changed since ofapi started."""
         return self.http.post("/_control/reload").raise_for_status().json()["reloaded"]
 
+    def s3_put(self, bucket: str, key: str, content: bytes, region: str = "us-east-1") -> None:
+        """Store an object in the emulated S3 (ofapi's moto), creating the bucket if needed."""
+        host = {"X-Original-Host": f"s3.{region}.amazonaws.com"}
+        if region != "us-east-1":
+            config = (
+                '<CreateBucketConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/">'
+                f"<LocationConstraint>{region}</LocationConstraint></CreateBucketConfiguration>"
+            )
+        else:
+            config = ""
+        self.http.put(f"/aws/{bucket}", headers=host, content=config)  # 409 when it exists
+        self.http.put(f"/aws/{bucket}/{key}", headers=host, content=content).raise_for_status()
+
     def hosts(self) -> dict[str, str]:
         return self.http.get("/_control/hosts").raise_for_status().json()
 
