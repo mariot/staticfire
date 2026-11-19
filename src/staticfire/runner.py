@@ -204,16 +204,16 @@ def install(
     if not component.python.exists():
         _run(["uv", "venv", "--python", ".".join(map(str, python)), str(component.venv)])
     if component.kind == "connector":
-        output = _run(
-            [
-                "uv",
-                "pip",
-                "install",
-                "--python",
-                str(component.python),
-                *_connector_requirements(root),
-            ]
-        )
+        requirements = _connector_requirements(root)
+        output = _run(["uv", "pip", "install", "--python", str(component.python), *requirements])
+        if (root / "pyproject.toml").exists() and str(root) not in requirements:
+            # its dependencies are installed: the connector itself, without them
+            output += _run(
+                [
+                    "uv", "pip", "install", "--python", str(component.python),
+                    "--no-deps", "-e", str(root),
+                ]
+            )  # fmt: skip
         (component.venv / INSTALLED_MARKER).write_text(component.path + "\n")
         return output
     requirements = ["-e", str(root)]
@@ -284,8 +284,23 @@ def _connector_requirements(root: Path) -> list[str]:
             requirements += ["-r", str(rewritten), "-e", str(sdk)]
         else:
             requirements += ["-r", str(candidate)]
-    if (root / "pyproject.toml").exists():
-        requirements += ["-e", str(root)]
+    pyproject = root / "pyproject.toml"
+    if pyproject.exists():
+        dependencies = (
+            tomllib.loads(pyproject.read_text()).get("project", {}).get("dependencies", [])
+        )
+        if sdk and any(d.strip().startswith("connectors-sdk") for d in dependencies):
+            # its pyproject takes the SDK from GitHub's master, whose pycti pin may differ: its
+            # other dependencies, the checkout's SDK, then the connector without dependencies
+            local = [d for d in dependencies if not d.strip().startswith("connectors-sdk")]
+            rewritten = VENVS_DIR / f"requirements-{root.name}-pyproject.txt"
+            rewritten.parent.mkdir(parents=True, exist_ok=True)
+            rewritten.write_text("\n".join(local) + "\n")
+            requirements += ["-r", str(rewritten)]
+            if str(sdk) not in requirements:
+                requirements += ["-e", str(sdk)]
+        else:
+            requirements += ["-e", str(root)]
     if not requirements:
         raise RunnerError(f"No requirements.txt or pyproject.toml in {root}")
     # httplib2 (Google API clients) only goes through HTTP(S)_PROXY with PySocks installed

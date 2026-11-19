@@ -847,6 +847,10 @@ def connector_test(
         # Every run starts from a blank state (two specs of one connector share its id)
         cti.reset_state(runner.detect(str(connector_dir), "connector").component_id)
         started = time.time()
+        # Works and objects carry the platform's time: a VM's clock drifts
+        skew = logscan.host_skew(profile)
+        report.refs["clock_skew_s"] = round(skew, 1)
+        platform_started = started + skew
         up = _start(report, profile, str(connector_dir), "connector", kind="connector", env=env)
         if not up:
             return report
@@ -878,7 +882,7 @@ def connector_test(
         def done() -> list[dict] | None:
             """Every work complete, and no new bundle for a while: a run sending one bundle per
             page looks complete between two pages."""
-            works = _connector_works(cti, connector_id, started)
+            works = _connector_works(cti, connector_id, platform_started)
             bundles = len(list(bundles_dir.glob("*.json")))
             if bundles != settled["bundles"]:
                 settled.update(bundles=bundles, since=time.time())
@@ -887,7 +891,7 @@ def connector_test(
             return works if time.time() - settled["since"] >= QUIET_SECONDS else None
 
         finished, works = wait_until(done, timeout or spec.timeout, 10)
-        works = works or _connector_works(cti, connector_id, started)
+        works = works or _connector_works(cti, connector_id, platform_started)
         report.evidence["works"] = works
         if not report.check("a connector run (work) completes", finished, works):
             return report
@@ -900,7 +904,7 @@ def connector_test(
                 processed >= spec.min_elements,
                 processed,
             )
-        since = datetime.fromtimestamp(started - 5, UTC).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+        since = datetime.fromtimestamp(platform_started - 5, UTC).strftime("%Y-%m-%dT%H:%M:%S.000Z")
         changed = cti.changed_since(since, creator_id=user_id)
         ingested = sorted({c.get("relationship_type") or c.get("entity_type") for c in changed})
         report.evidence["ingested_types"] = ingested
