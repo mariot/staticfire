@@ -34,7 +34,7 @@ def _domain_indicator(cti) -> list[str]:
 
 
 SPEC = ConnectorSpec(
-    recipe="logrhythm",
+    recipe="logrhythm-cti",
     connector="stream/logrhythm",
     env=lambda fake: {
         "LOGRHYTHM_URL": "https://logrhythm.staticfire.test:8501/lr-admin-api",

@@ -1,7 +1,7 @@
 from staticfire.connector_vendors import ConnectorSpec
 
 SPEC = ConnectorSpec(
-    recipe="mitre-atlas",
+    recipe="mitre-atlas-cti",
     connector="external-import/mitre-atlas",
     expected_types={
         "attack-pattern",

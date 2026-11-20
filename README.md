@@ -54,15 +54,16 @@ is 0 on `PASS`. Components are stopped at the end unless `--keep`; the vendor fa
 recipe started it. ofapi is served on `http://127.0.0.1:8000` and `https://127.0.0.1:8443` by one
 process, so both share its scripted rules and journal.
 
-There are 33 recipes in five families; `staticfire fire` lists them with a one-line description.
+There are 49 OpenAEV recipes in five families; `staticfire fire` lists them with a one-line
+description.
 
 | Family | Recipes | How it works | Defined in |
 |---|---|---|---|
 | Email | `email-smtp`, `mailpit-collector` | `email-smtp` sends through mailpit; the mailpit collector (`collectors/mailpit`, this repo) answers email injects whose implant name sits in a header, a body URL or an attachment (`--carrier header\|url\|attachment\|all\|none`) | `recipes.py` |
-| EDR / XDR / SIEM collectors | `cortex-xdr`, `cortex-xsoar`, `crowdstrike`, `sentinelone`, `tanium`, `elastic`, `logrhythm`, `netwitness`, `qradar`, `splunk-es` | the agent runs a harmless marker command; ofapi answers the collector with vendor data built from the real expectation signals for `--verdict prevented\|detected\|none`; the collector must report that verdict and have queried its vendor | `vendors.py` |
+| EDR / XDR / SIEM collectors | `cortex-xdr`, `cortex-xsoar`, `crowdstrike`, `sentinelone`, `tanium`, `elastic`, `logrhythm`, `netwitness`, `qradar`, `splunk-es`, `microsoft-defender`, `microsoft-defender-o365`, `microsoft-sentinel`, `microsoft-sentinel-defender` | the agent runs a harmless marker command; ofapi answers the collector with vendor data built from the real expectation signals for `--verdict prevented\|detected\|none`; the collector must report that verdict and have queried its vendor. An email security spec (`email=True`) gets its expectations from an email-smtp inject whose implant is in a body URL, its vendor answering from the delivered message; a SIEM spec chained on an EDR (`edr=`) runs that EDR collector first, on the same expectations | `vendors.py` |
 | AI defense | `lakera-guard`, `cisco-ai-defense`, `hiddenlayer`, `prisma-airs`, `prompt-security`, `xtm-one` | `ai-redteam` attacks ofapi's OpenAI-compatible model through an AI target; the firewall's verdict (`--verdict blocked\|flagged\|clean`) is scripted on ofapi; the collector must answer the agentless expectations | `ai_vendors.py` |
-| Vendor injectors | `censys`, `shodan`, `slack`, `teams`, `email-google-workspace`, `email-m365`, `nmap`, `netexec`, `prowler`, `stratus`, `aws` | HTTP-API injectors call ofapi; command-line ones run stub tools that reproduce the tool's arguments and output format (so the injector's parser runs for real); checks: status, completion message, findings, vendor calls | `injector_vendors.py` |
-| Catalog / asset collectors | `mitre-atlas`, `nvd-nist-cve`, `openaev-payloads`, `aws-resources` | the collector imports ofapi's small dataset; the platform must hold what it implies and nothing it excludes (revoked technique, CVE without CVSS v3.1, terminated instance) | `catalog_vendors.py` |
+| Vendor injectors | `censys`, `shodan`, `slack`, `teams`, `email-google-workspace`, `email-m365`, `nmap`, `netexec`, `prowler`, `stratus`, `aws`, `http-query`, `http-query-form`, `nuclei` | HTTP-API injectors call ofapi; command-line ones run stub tools that reproduce the tool's arguments and output format (so the injector's parser runs for real); checks: status, completion message, findings, vendor calls | `injector_vendors.py` |
+| Catalog / asset collectors | `mitre-atlas`, `nvd-nist-cve`, `openaev-payloads`, `aws-resources`, `mitre-attack`, `atomic-red-team`, `microsoft-entra`, `microsoft-intune`, `microsoft-intune-groups`, `microsoft-azure`, `microsoft-azure-subscription`, `google-workspace`, `google-workspace-all-users`, `ovhcloud`, `ovhcloud-oauth2`, `scenarios`, `scenarios-tampered` | the collector imports ofapi's small dataset; the platform must hold what it implies and nothing it excludes (revoked technique, CVE without CVSS v3.1, terminated instance, guest user, suspended server...). The checks read the dataset back from ofapi; a `setup` removes what an earlier run imported. `scenarios` runs dry: its log and GitHub calls are checked | `catalog_vendors.py` |
 
 `staticfire matrix [recipes...] --all-verdicts --out <dir>` runs any set of them one after the
 other (they share the platform and the fake), saves each JSON report and prints a summary table;
@@ -217,13 +218,38 @@ trace message).
   platform but never attached: `AiSignatureUtils.computeAiSignatures` has no caller, so AI
   expectations only carry `parent_process_name`. The AI collectors work around it by recomputing
   the marker.
+- Not filed yet, found by the proxy recipes (each recipe named reproduces it):
+  - pyoaev's `http_put` parses every answer as JSON, while `PUT /api/injects/expectations/bulk`
+    answers 200 with an empty body: every successful bulk update raises, and the Microsoft
+    collectors redo each update one by one (`microsoft-defender`, warning in its log).
+  - `microsoft-defender-o365` can match no expectation: the platform's expectations carry
+    `parent_process_name` only, which the alert data never holds, and its engine requires every
+    signature type (`microsoft-defender-o365 --verdict prevented`). It also answers "Not
+    Detected" at its first poll: it has no retry window.
+  - `microsoft-sentinel` matches on the `alertId` an EDR collector recorded; `microsoft-defender`
+    (the pairing its README gives) records none (`microsoft-sentinel-defender`).
+  - `microsoft-entra` imports no user (`include_external` reaches it as 0/1, compared with
+    `is True`/`is False`) and stops at the second page of groups (`groups.with_url(...)` is
+    awaited without `.get()`) (`microsoft-entra`).
+  - `microsoft-intune` and `microsoft-azure` crash without a device group / resource group
+    (`device_groups_list` / `resource_groups_list` never set) (`microsoft-intune`,
+    `microsoft-azure-subscription`); Intune device groups are looked up with
+    `resourceProvisioningOptions/Any(x:x eq 'Intune')`, which no security group has
+    (`microsoft-intune-groups`).
+  - `atomic-red-team` turns `Test-Path PathToAtomicsFolder\...\file.ps1)` into an argument named
+    `file_ps1)_atomicredteam_path` and an unbalanced check command (`atomic-red-team`).
+  - `ovhcloud` reads `image` and `flavor` from `GET /cloud/project/{id}/instance`, whose items
+    (`cloud.instance.Instance`) only have `imageId` and `flavorId`: Public Cloud instances get
+    platform Unknown (`ovhcloud`).
+  - `google-workspace` (httplib2) ignores an HTTPS proxy unless PySocks is installed, and reports
+    "Synchronization completed successfully" when its token request fails.
 
-Not testable against a fake without a collector change (hardcoded vendor hosts):
-`microsoft-defender`, `microsoft-defender-o365` (MSAL authority), `microsoft-azure`,
-`microsoft-intune`, `microsoft-sentinel`, `microsoft-entra` (Graph host), `google-workspace`,
-`ovhcloud`, `mitre-attack`, `atomic-red-team`. `scenarios` only verifies releases in dry-run mode,
-against an HTTPS GitHub API. Not covered yet: `nuclei` (its startup imports CVE contracts from
-GitHub into the platform) and `http-query` (tested by hand only).
+Components with a hardcoded vendor host (Microsoft, Google, OVHcloud, GitHub) run with
+`proxy=True`: their HTTP(S) goes through the TLS-intercepting proxy to the ofapi module declaring
+that host, as for OpenCTI connectors. Recipes reset ofapi's rules and journal under their own
+paths only (a prefix several vendors share, such as `/microsoft-graph` or `/github`, is never reset
+whole), and requests a test makes itself to ofapi carry `X-Staticfire-Check`, which
+`Ofapi.journal()` leaves out.
 
 ## Development
 

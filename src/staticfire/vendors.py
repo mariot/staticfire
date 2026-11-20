@@ -9,6 +9,7 @@ any spec end to end.
 from __future__ import annotations
 
 import json
+import zlib
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -27,6 +28,11 @@ class Signals:
     start: datetime
     end: datetime
     ips: list[str]
+    # Email injects: the delivered message (from, to, cc, subject, urls, message_id, date)
+    email: dict = field(default_factory=dict)
+    # SIEM chained after an EDR collector: that EDR's recipe, and the alertId it recorded
+    edr: str = ""
+    edr_alert_ids: list[str] = field(default_factory=list)
 
     @property
     def end_ms(self) -> int:
@@ -92,6 +98,12 @@ class VendorCollector:
     period: str = "PT15S"
     # Send its HTTP(S) through the proxy to ofapi (hardcoded vendor hosts, SDKs)
     proxy: bool = False
+    # Email security collector: the expectations come from an email-smtp inject (delivered to
+    # mailpit, its implant name in a body URL) instead of the agent's marker command
+    email: bool = False
+    # A SIEM matching what an EDR collector answered: that EDR's recipe, run first (same
+    # verdict) on the same expectations
+    edr: str = ""
     description: str = ""
 
     @property
@@ -512,6 +524,476 @@ CORTEX_XSOAR = VendorCollector(
 )
 
 
+# -- Microsoft (Graph security alerts, reached through the proxy) --
+# The Microsoft collectors hardcode login.microsoftonline.com (MSAL) and graph.microsoft.com:
+# the proxy hands both to ofapi (microsoft_identity, microsoft_graph), the rules below answer.
+
+MS_TENANT = "6f1c2a4e-0b7d-4c55-9e3a-8d2f1b6c7a90"
+MS_GRAPH_ALERTS = "/microsoft-graph/v1.0/security/alerts_v2"
+
+
+def ms_token_path(tenant: str = MS_TENANT) -> str:
+    return f"/microsoft-login/{tenant}/oauth2/v2.0/token"
+
+
+def _ms_env(prefix: str, **extra: str) -> Callable[[Ofapi], dict[str, str]]:
+    """Client-credentials settings of a Microsoft collector (its variables' prefix)."""
+
+    def env(_fake: Ofapi) -> dict[str, str]:
+        return {
+            f"{prefix}TENANT_ID": MS_TENANT,
+            f"{prefix}CLIENT_ID": "3c9e5f21-7a44-4d0e-8b6b-2f9d0c1e4a77",
+            f"{prefix}CLIENT_SECRET": "staticfire~fake.secret-value",
+            **extra,
+        }
+
+    return env
+
+
+def _iso(moment: datetime, offset_s: float = 0) -> str:
+    from datetime import timedelta
+
+    return (moment + timedelta(seconds=offset_s)).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+
+
+def graph_alert(
+    alert_id: str,
+    service_source: str,
+    title: str,
+    at: datetime,
+    status: str,
+    evidence: list[dict],
+    detection_source: str | None = None,
+) -> dict:
+    """A Microsoft Graph security alert (alerts_v2) as Graph returns it."""
+    return {
+        "@odata.type": "#microsoft.graph.security.alert",
+        "id": alert_id,
+        "providerAlertId": alert_id.removeprefix("da"),
+        "incidentId": str(zlib.crc32(alert_id.encode()) % 90000 + 10000),
+        "status": status,
+        "severity": "medium",
+        "classification": "truePositive" if status == "resolved" else None,
+        "determination": "malware" if status == "resolved" else None,
+        "serviceSource": service_source,
+        "detectionSource": detection_source or service_source,
+        "productName": "Microsoft Defender for Endpoint",
+        "detectorId": "7e5a1c4b-2d33-4f0a-9c8e-1b6d2f4a8e10",
+        "tenantId": MS_TENANT,
+        "title": title,
+        "description": f"{title}. Alert raised by the staticfire scenario.",
+        "recommendedActions": "Examine the process tree and the files it wrote.",
+        "category": "Execution",
+        "assignedTo": None,
+        "alertWebUrl": f"https://security.microsoft.com/alerts/{alert_id}?tid={MS_TENANT}",
+        "incidentWebUrl": f"https://security.microsoft.com/incident2/1/overview?tid={MS_TENANT}",
+        "actorDisplayName": None,
+        "threatDisplayName": None,
+        "threatFamilyName": None,
+        "mitreTechniques": ["T1059.004"],
+        "createdDateTime": _iso(at, 20),
+        "lastUpdateDateTime": _iso(at, 40),
+        "resolvedDateTime": _iso(at, 40) if status == "resolved" else None,
+        "firstActivityDateTime": _iso(at),
+        "lastActivityDateTime": _iso(at, 5),
+        "systemTags": [],
+        "comments": [],
+        "customDetails": {},
+        "evidence": evidence,
+    }
+
+
+def _evidence(kind: str, at: datetime, status: str, **fields) -> dict:
+    return {
+        "@odata.type": f"#microsoft.graph.security.{kind}",
+        "createdDateTime": _iso(at, 20),
+        "verdict": "malicious",
+        "remediationStatus": "prevented" if status == "prevented" else "active",
+        "remediationStatusDetails": None,
+        "roles": [],
+        "detailedRoles": [],
+        "tags": [],
+        **fields,
+    }
+
+
+def device_evidence(at: datetime, status: str, hostname: str, ip: str) -> dict:
+    return _evidence(
+        "deviceEvidence",
+        at,
+        status,
+        mdeDeviceId="4f8d2e6a1b3c5d7e9f0a2b4c6d8e0f1a3b5c7d9e",
+        azureAdDeviceId=None,
+        deviceDnsName=hostname,
+        hostName=hostname,
+        osPlatform="Linux",
+        healthStatus="active",
+        onboardingStatus="onboarded",
+        lastIpAddress=ip,
+        lastExternalIpAddress="203.0.113.24",
+        ipInterfaces=[ip],
+        loggedOnUsers=[{"accountName": "root", "domainName": hostname}],
+    )
+
+
+def process_evidence(at: datetime, status: str, image: str, parent: str, cmd: str) -> dict:
+    def file(name: str) -> dict:
+        return {
+            "sha1": None,
+            "sha256": None,
+            "fileName": name,
+            "filePath": "/tmp" if name.startswith("oaev") else "/usr/bin",
+            "fileSize": 4096,
+        }
+
+    return _evidence(
+        "processEvidence",
+        at,
+        status,
+        detectionStatus=status,
+        processId=48211,
+        parentProcessId=48190,
+        processCommandLine=cmd,
+        processCreationDateTime=_iso(at),
+        parentProcessCreationDateTime=_iso(at, -1),
+        mdeDeviceId="4f8d2e6a1b3c5d7e9f0a2b4c6d8e0f1a3b5c7d9e",
+        imageFile=file(image),
+        parentProcessImageFile=file(parent),
+        userAccount={"accountName": "root", "domainName": None, "userSid": None},
+    )
+
+
+def _noise_alert(service_source: str, at: datetime) -> dict:
+    """An unrelated alert on another device: it must match no expectation."""
+    return graph_alert(
+        "da638650112233445566_-1029384756",
+        service_source,
+        "Suspicious PowerShell command line",
+        at,
+        "new",
+        [
+            device_evidence(at, "detected", "fin-laptop-07", "10.20.30.40"),
+            process_evidence(
+                at,
+                "detected",
+                "powershell.exe",
+                "winword.exe",
+                "powershell.exe -nop -w hidden -enc SQBFAFgA",
+            ),
+        ],
+    )
+
+
+def _defender_rules(s: Signals, verdict: str) -> list[Rule]:
+    alerts = [_noise_alert("microsoftDefenderForEndpoint", s.end)]
+    if verdict != "none":
+        # The collector reads a prevention from the alert status (inProgress/resolved)
+        status = "prevented" if verdict == "prevented" else "detected"
+        alerts.insert(
+            0,
+            graph_alert(
+                "da638650998877665544_1122334455",
+                "microsoftDefenderForEndpoint",
+                f"Suspicious process launched by {s.implant}",
+                s.end,
+                "resolved" if verdict == "prevented" else "new",
+                [
+                    device_evidence(s.end, status, s.hostname, s.ipv4),
+                    process_evidence(s.end, status, "sh", s.implant, "sh -c 'echo marker'"),
+                ],
+            ),
+        )
+    body = {
+        "@odata.context": "https://graph.microsoft.com/v1.0/$metadata#security/alerts_v2",
+        "value": alerts,
+    }
+    return [Rule(MS_GRAPH_ALERTS, body, method="GET")]
+
+
+MICROSOFT_DEFENDER = VendorCollector(
+    recipe="microsoft-defender",
+    collector="microsoft-defender",
+    env=_ms_env("SOURCE_"),
+    rules=_defender_rules,
+    calls=[ms_token_path(), MS_GRAPH_ALERTS],
+    proxy=True,
+    description="Graph alerts_v2: a Defender for Endpoint alert whose process evidence has the "
+    "implant as parent, resolved when blocked, next to an unrelated alert",
+)
+
+
+def message_evidence(at: datetime, email: dict, blocked: bool) -> dict:
+    """The analyzedMessageEvidence Defender for Office 365 attaches to an email alert."""
+    sender = email.get("from") or "sender@staticfire.test"
+    urls = email.get("urls") or []
+    return _evidence(
+        "analyzedMessageEvidence",
+        at,
+        "prevented" if blocked else "detected",
+        networkMessageId="c1f0e8a2-5b7d-4e3a-9f2c-08dd1a2b3c4d",
+        internetMessageId=email.get("message_id") or "<staticfire@staticfire.test>",
+        subject=email.get("subject"),
+        receivedDateTime=_iso(at),
+        recipientEmailAddress=(email.get("to") or "user@staticfire.test"),
+        senderIp="198.51.100.25",
+        p1Sender={
+            "emailAddress": sender,
+            "displayName": "staticfire",
+            "domainName": sender.split("@")[-1],
+        },
+        p2Sender={
+            "emailAddress": sender,
+            "displayName": "staticfire",
+            "domainName": sender.split("@")[-1],
+        },
+        antiSpamDirection="inbound",
+        deliveryAction="blocked" if blocked else "delivered",
+        deliveryLocation="quarantine" if blocked else "inbox",
+        language="en",
+        threats=["Phish"],
+        threatDetectionMethods=["urlDetonationReputation"],
+        urls=urls,
+        urlCount=len(urls),
+        attachmentsCount=0,
+    )
+
+
+def _defender_o365_rules(s: Signals, verdict: str) -> list[Rule]:
+    source = "microsoftDefenderForOffice365"
+    other = {
+        "from": "billing@invoices-portal.example",
+        "to": "finance@staticfire.test",
+        "subject": "Overdue invoice 4471",
+        "urls": ["https://invoices-portal.example/view?id=4471"],
+        "message_id": "<4471.invoice@invoices-portal.example>",
+    }
+    alerts = [
+        graph_alert(
+            "fa638650223344556677_-554433221",
+            source,
+            "Email messages containing malicious URL removed after delivery",
+            s.end,
+            "new",
+            [message_evidence(s.end, other, False)],
+        )
+    ]
+    if verdict != "none":
+        blocked = verdict == "prevented"
+        alerts.insert(
+            0,
+            graph_alert(
+                "fa638650998877665544_1122334455",
+                source,
+                "Email messages containing malicious URL",
+                s.end,
+                "resolved" if blocked else "new",
+                [message_evidence(s.end, s.email, blocked)],
+            ),
+        )
+    for alert in alerts:
+        alert["productName"] = "Microsoft Defender for Office 365"
+        alert["category"] = "InitialAccess"
+        alert["mitreTechniques"] = ["T1566.002"]
+    body = {
+        "@odata.context": "https://graph.microsoft.com/v1.0/$metadata#security/alerts_v2",
+        "value": alerts,
+    }
+    return [Rule(MS_GRAPH_ALERTS, body, method="GET")]
+
+
+MICROSOFT_DEFENDER_O365 = VendorCollector(
+    recipe="microsoft-defender-o365",
+    collector="microsoft-defender-o365",
+    env=_ms_env("SOURCE_"),
+    rules=_defender_o365_rules,
+    # It has no retry window: an expectation it cannot match is answered negative at once
+    expected={
+        "prevented": {"DETECTION": "Detected", "PREVENTION": "Prevented"},
+        "detected": {"DETECTION": "Detected", "PREVENTION": "Not Prevented"},
+        "none": {"DETECTION": "Not Detected", "PREVENTION": "Not Prevented"},
+    },
+    calls=[ms_token_path(), MS_GRAPH_ALERTS],
+    proxy=True,
+    email=True,
+    description="Graph alerts_v2: a Defender for Office 365 alert on the delivered email (sender, "
+    "recipient, its URLs, one carrying the implant), blocked and resolved when prevented",
+)
+
+
+# -- Microsoft Sentinel (Log Analytics SecurityAlert, chained after an EDR collector) --
+# It matches an expectation an EDR collector already answered with an alertId in its result
+# metadata, when a Sentinel alert's link holds that id: what Sentinel's EDR data connectors
+# ingest. The fake EDR alert ids are the ones the EDR specs above script.
+
+SENTINEL_WORKSPACE = "9e3b7c1a-4f2d-4a6b-8c0e-5d1f2a3b4c6e"
+SENTINEL_QUERY = f"/microsoft-sentinel/v1/workspaces/{SENTINEL_WORKSPACE}/query"
+SENTINEL_COLUMNS = [
+    ("TenantId", "string"),
+    ("TimeGenerated", "datetime"),
+    ("DisplayName", "string"),
+    ("AlertName", "string"),
+    ("AlertSeverity", "string"),
+    ("Description", "string"),
+    ("ProviderName", "string"),
+    ("VendorName", "string"),
+    ("VendorOriginalId", "string"),
+    ("SystemAlertId", "string"),
+    ("ResourceId", "string"),
+    ("SourceComputerId", "string"),
+    ("AlertType", "string"),
+    ("ConfidenceLevel", "string"),
+    ("ConfidenceScore", "real"),
+    ("IsIncident", "bool"),
+    ("StartTime", "datetime"),
+    ("EndTime", "datetime"),
+    ("ProcessingEndTime", "datetime"),
+    ("RemediationSteps", "string"),
+    ("ExtendedProperties", "string"),
+    ("Entities", "string"),
+    ("SourceSystem", "string"),
+    ("WorkspaceSubscriptionId", "string"),
+    ("WorkspaceResourceGroup", "string"),
+    ("ExtendedLinks", "string"),
+    ("ProductName", "string"),
+    ("ProductComponentName", "string"),
+    ("AlertLink", "string"),
+    ("Status", "string"),
+    ("CompromisedEntity", "string"),
+    ("Tactics", "string"),
+    ("Techniques", "string"),
+    ("SubTechniques", "string"),
+    ("Type", "string"),
+]
+
+
+def _log_date(moment: datetime, offset_s: float = 0) -> str:
+    return _iso(moment, offset_s).replace("Z", "0000Z")
+
+
+def _sentinel_alert(s: Signals, verdict: str) -> dict:
+    """A SecurityAlert row as the EDR's Sentinel data connector writes it."""
+    blocked = verdict == "prevented"
+    if s.edr == "crowdstrike":
+        vendor_id = "staticfire-1"  # the alert entity of _crowdstrike_rules
+        provider, vendor, product = "CrowdStrike", "CrowdStrike", "CrowdStrike Falcon"
+        link = f"https://falcon.crowdstrike.com/activity-v2/detections/cid:ind:{vendor_id}"
+        name = "Process blocked by Falcon prevention" if blocked else "Suspicious process"
+    else:
+        vendor_id = "da638650998877665544_1122334455"  # the alert of _defender_rules
+        provider, vendor, product = (
+            "MDATP",
+            "Microsoft",
+            "Microsoft Defender Advanced Threat Protection",
+        )
+        link = f"https://security.microsoft.com/alerts/{vendor_id}?tid={MS_TENANT}"
+        name = "Suspicious process was prevented" if blocked else "Suspicious process launched"
+    entities = [
+        {"$id": "2", "HostName": s.hostname, "OSFamily": "Linux", "Type": "host"},
+        {"$id": "3", "Address": s.ipv4, "Type": "ip"},
+        {"$id": "4", "ProcessId": "48190", "CommandLine": s.implant, "Type": "process"},
+    ]
+    return {
+        "TenantId": MS_TENANT,
+        "TimeGenerated": _log_date(s.end, 60),
+        "DisplayName": f"{name} on {s.hostname}",
+        "AlertName": name,
+        "AlertSeverity": "High",
+        "Description": f"{name}: {s.implant}",
+        "ProviderName": provider,
+        "VendorName": vendor,
+        "VendorOriginalId": vendor_id,
+        "SystemAlertId": "8c2d4f6a-1b3e-4d5f-9a7c-0e2b4d6f8a1c",
+        "ResourceId": "",
+        "SourceComputerId": "",
+        "AlertType": "EDR",
+        "ConfidenceLevel": "Unknown",
+        "ConfidenceScore": None,
+        "IsIncident": False,
+        "StartTime": _log_date(s.end),
+        "EndTime": _log_date(s.end, 5),
+        "ProcessingEndTime": _log_date(s.end, 60),
+        "RemediationSteps": "[]",
+        "ExtendedProperties": json.dumps({"Alert Link": link}),
+        "Entities": json.dumps(entities),
+        "SourceSystem": "Detection",
+        "WorkspaceSubscriptionId": "1a2b3c4d-5e6f-4a8b-9c0d-1e2f3a4b5c6d",
+        "WorkspaceResourceGroup": "rg-staticfire",
+        "ExtendedLinks": json.dumps([{"Href": link, "Category": "Alert", "Label": "Alert"}]),
+        "ProductName": product,
+        "ProductComponentName": "",
+        "AlertLink": link,
+        "Status": "Resolved" if blocked else "New",
+        "CompromisedEntity": s.hostname,
+        "Tactics": "Execution",
+        "Techniques": '["T1059"]',
+        "SubTechniques": "[]",
+        "Type": "SecurityAlert",
+    }
+
+
+def _sentinel_rules(s: Signals, verdict: str) -> list[Rule]:
+    unrelated = _sentinel_alert(s, "detected") | {
+        "SystemAlertId": "1f3e5d7c-9b2a-4c6e-8d0f-2a4c6e8f0b1d",
+        "VendorOriginalId": "da638650000011112222_9988776655",
+        "AlertLink": "https://security.microsoft.com/alerts/da638650000011112222_9988776655",
+        "DisplayName": "Suspicious sign-in activity",
+        "AlertName": "Suspicious sign-in activity",
+        "CompromisedEntity": "fin-laptop-07",
+    }
+    alerts = [unrelated] + ([_sentinel_alert(s, verdict)] if verdict != "none" else [])
+    columns = [{"name": name, "type": kind} for name, kind in SENTINEL_COLUMNS]
+    rows = [[alert[name] for name, _ in SENTINEL_COLUMNS] for alert in alerts]
+    body = {"tables": [{"name": "PrimaryResult", "columns": columns, "rows": rows}]}
+    return [Rule(SENTINEL_QUERY, body, method="POST")]
+
+
+def _sentinel_env(edr_collector: str) -> Callable[[Ofapi], dict[str, str]]:
+    def env(fake: Ofapi) -> dict[str, str]:
+        from staticfire import recipes, runner
+
+        edr_id = runner.detect(recipes.checkout("collectors", edr_collector), "collector")
+        return _ms_env(
+            "COLLECTOR_MICROSOFT_SENTINEL_",
+            COLLECTOR_MICROSOFT_SENTINEL_SUBSCRIPTION_ID="1a2b3c4d-5e6f-4a8b-9c0d-1e2f3a4b5c6d",
+            COLLECTOR_MICROSOFT_SENTINEL_WORKSPACE_ID=SENTINEL_WORKSPACE,
+            COLLECTOR_MICROSOFT_SENTINEL_RESOURCE_GROUP="rg-staticfire",
+            COLLECTOR_MICROSOFT_SENTINEL_EDR_COLLECTORS=edr_id.component_id,
+        )(fake)
+
+    return env
+
+
+# Sentinel answers prevention only from an alert whose name says it was blocked; it fails an
+# expectation only once it is 45 minutes old
+SENTINEL_EXPECTED = DETECT_AND_PREVENT
+
+MICROSOFT_SENTINEL = VendorCollector(
+    recipe="microsoft-sentinel",
+    collector="microsoft-sentinel",
+    env=_sentinel_env("crowdstrike"),
+    rules=_sentinel_rules,
+    expected=SENTINEL_EXPECTED,
+    calls=[ms_token_path(), SENTINEL_QUERY],
+    proxy=True,
+    edr="crowdstrike",
+    description="after the crowdstrike collector answered: a SecurityAlert from the Falcon data "
+    "connector whose link holds the Falcon alert id, named 'blocked' when prevented",
+)
+
+MICROSOFT_SENTINEL_DEFENDER = VendorCollector(
+    recipe="microsoft-sentinel-defender",
+    collector="microsoft-sentinel",
+    env=_sentinel_env("microsoft-defender"),
+    rules=_sentinel_rules,
+    expected=SENTINEL_EXPECTED,
+    calls=[ms_token_path(), SENTINEL_QUERY],
+    proxy=True,
+    edr="microsoft-defender",
+    description="after the microsoft-defender collector answered (the pairing its README "
+    "documents): a SecurityAlert from the Defender connector linking the Defender alert",
+)
+
+
 SPECS: dict[str, VendorCollector] = {
     spec.recipe: spec
     for spec in [
@@ -525,5 +1007,9 @@ SPECS: dict[str, VendorCollector] = {
         NETWITNESS,
         QRADAR,
         SPLUNK_ES,
+        MICROSOFT_DEFENDER,
+        MICROSOFT_DEFENDER_O365,
+        MICROSOFT_SENTINEL,
+        MICROSOFT_SENTINEL_DEFENDER,
     ]
 }

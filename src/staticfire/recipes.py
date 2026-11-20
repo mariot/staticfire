@@ -720,6 +720,13 @@ def catalog_collector(
         _reset_own(fake, spec.calls)
         if spec.setup:
             spec.setup(ops.client(profile), fake)
+        if spec.test_packages:
+            component = runner.detect(collector, "collector")
+            if not component.installed:
+                runner.install(component)
+            runner._run(
+                ["uv", "pip", "install", "--python", str(component.python), *spec.test_packages]
+            )
         env = {
             **(fakes.component_proxy_env(fake, profile.host) if spec.proxy else {}),
             **spec.env(fake),

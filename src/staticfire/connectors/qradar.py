@@ -32,7 +32,7 @@ def _indicator(cti) -> list[str]:
 
 
 SPEC = ConnectorSpec(
-    recipe="qradar",
+    recipe="qradar-cti",
     connector="stream/qradar",
     env=lambda fake: {
         "QRADAR_URL": f"https://{DOMAIN}",

@@ -428,6 +428,122 @@ AWS = VendorInjector(
     description="list S3 buckets (stubbed aws CLI): bucket names become findings",
 )
 
+# -- http-query: requests to ofapi's echo endpoint (over TLS), which answers what it got --
+
+HTTP_RAW_POST = "5948c96c-4064-4c0d-b079-51ec33f31b91"
+HTTP_GET = "611f223d-0e95-4f5b-ad89-a09ec2be50ae"
+HTTP_FORM_PUT = "d11d7694-29d1-4c1a-b1d7-9fc4251f0466"
+# base64 of staticfire:s3cret-pass, as the injector's basic auth sends it
+HTTP_BASIC = "Basic c3RhdGljZmlyZTpzM2NyZXQtcGFzcw=="
+
+
+def _http_env(ctx: Context) -> dict[str, str]:
+    return {"REQUESTS_CA_BUNDLE": str(ctx.fake.cert)}
+
+
+HTTP_QUERY = VendorInjector(
+    recipe="http-query",
+    injector="http-query",
+    contract=HTTP_RAW_POST,
+    env=_http_env,
+    content=lambda ctx: {
+        "uri": ctx.fake.https_url("echo") + f"?run={ctx.token}",
+        "basicAuth": True,
+        "basicUser": "staticfire",
+        "basicPassword": "s3cret-pass",
+        "headers": [
+            {"key": "X-Staticfire-Run", "value": ctx.token},
+            {"key": "Content-Type", "value": "application/json"},
+        ],
+        "body": f'{{"event": "staticfire probe", "run": "{ctx.token}"}}',
+    },
+    # The completion message is the echo of the request the injector sent
+    message=r'^(?=.*"method":"POST")(?=.*"authorization":"'
+    + HTTP_BASIC.replace("+", r"\+")
+    + r'")(?=.*"x-staticfire-run":"[0-9a-f]{10}")'
+    + r'(?=.*"body":"\{\\"event\\": \\"staticfire probe)',
+    calls=[("POST", "/echo")],
+    description="raw POST with basic auth and custom headers to an echo endpoint: the echo "
+    "of the request it sent is the inject's result",
+)
+
+HTTP_QUERY_FORM = VendorInjector(
+    recipe="http-query-form",
+    injector="http-query",
+    contract=HTTP_FORM_PUT,
+    env=_http_env,
+    content=lambda ctx: {
+        "uri": ctx.fake.https_url("echo"),
+        "basicAuth": False,
+        "headers": [{"key": "X-Staticfire-Run", "value": ctx.token}],
+        "parts": [
+            {"key": "action", "value": "isolate"},
+            {"key": "run", "value": ctx.token},
+        ],
+    },
+    message=r'"method":"PUT".*"content-type":"application/x-www-form-urlencoded".*'
+    r'"body":"action=isolate&run=[0-9a-f]{10}"',
+    calls=[("PUT", "/echo")],
+    description="key/value PUT: the parts sent as a form",
+)
+
+
+# -- nuclei (stubbed nuclei; its CVE contract index comes from the GitHub fake) --
+
+NUCLEI_CVE_SCAN = "2e7fc079-4444-4531-4444-928fe4a1fc0b"
+
+NUCLEI_STUB = r"""#!/bin/sh
+# staticfire stub: nuclei -version | -update-templates | -validate -t <path> |
+# nuclei <flags> -tags <tag> -jsonl, targets on stdin: one JSON line per match, the shape
+# nuclei_output_parser reads (matcher-status, info.classification.cve-id, host)
+case "$1" in
+  -version) echo "[INF] Nuclei Engine Version: v3.4.10" >&2; exit 0 ;;
+  -update-templates) echo "[INF] No new updates found for nuclei templates" >&2; exit 0 ;;
+  -validate) echo "[INF] All templates validated successfully" >&2; exit 0 ;;
+esac
+echo "$*" >> "$(dirname "$0")/nuclei.args"
+tags=""
+prev=""
+for arg in "$@"; do
+  if [ "$prev" = "-tags" ]; then tags="$arg"; fi
+  prev="$arg"
+done
+echo "[INF] Current nuclei version: v3.4.10 (latest)" >&2
+matches=0
+while read -r target; do
+  [ -z "$target" ] && continue
+  if [ "$tags" = "cve" ]; then
+    printf '{"template":"http/cves/2021/CVE-2021-44228.yaml","template-id":"CVE-2021-44228",'
+    printf '"info":{"name":"Apache Log4j2 Remote Code Injection","author":["melbadry9"],'
+    printf '"tags":["cve","cve2021","rce","log4j","kev"],"severity":"critical",'
+    printf '"classification":{"cve-id":["cve-2021-44228"],"cwe-id":["cwe-502"],'
+    printf '"cvss-score":10}},"type":"http","host":"%s","port":"8080","scheme":"http",' "$target"
+    printf '"url":"http://%s:8080","matched-at":"http://%s:8080/api/login",' "$target" "$target"
+    printf '"ip":"%s","timestamp":"2026-11-19T10:00:00.000000000Z",' "$target"
+    printf '"matcher-status":true}\n'
+    matches=$((matches + 1))
+  fi
+done
+echo "[INF] Scan completed in 2.1s. $matches matches found." >&2
+"""
+
+NUCLEI = VendorInjector(
+    recipe="nuclei",
+    injector="nuclei",
+    contract=NUCLEI_CVE_SCAN,
+    env=lambda ctx: {"NUCLEI_DISABLE_INTERACTSH": "true"},
+    content=lambda ctx: {"target_selector": "assets", "target_property_selector": "automatic"},
+    stubs={"nuclei": NUCLEI_STUB},
+    target_endpoint=True,
+    message=r"Nuclei completed: 1 CVE\(S\)",
+    findings=[("cve", "CVE-2021-44228")],
+    calls=[("GET", "/github/projectdiscovery/nuclei-templates/refs/heads/main/cves.json")],
+    proxy=True,
+    description="CVE scan of the agent endpoint (stubbed nuclei): a Log4Shell match becomes a "
+    "CVE finding; at startup the CVE contracts index comes from GitHub",
+)
+
+
 SPECS: dict[str, VendorInjector] = {
     spec.recipe: spec
     for spec in [
@@ -442,5 +558,8 @@ SPECS: dict[str, VendorInjector] = {
         PROWLER,
         STRATUS,
         AWS,
+        HTTP_QUERY,
+        HTTP_QUERY_FORM,
+        NUCLEI,
     ]
 }

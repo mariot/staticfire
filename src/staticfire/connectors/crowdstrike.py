@@ -1,7 +1,7 @@
 from staticfire.connector_vendors import ConnectorSpec
 
 SPEC = ConnectorSpec(
-    recipe="crowdstrike",
+    recipe="crowdstrike-cti",
     connector="external-import/crowdstrike",
     env=lambda fake: {
         "CROWDSTRIKE_CLIENT_ID": "staticfire-client",

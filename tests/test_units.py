@@ -138,3 +138,13 @@ def test_every_recipe_has_a_description_and_back():
 
     assert set(recipes.RECIPES) == set(recipes.DESCRIPTIONS)
     assert len(recipes.RECIPES) >= 30
+
+
+def test_connector_recipes_never_shadow_openaev_ones():
+    from staticfire import ai_vendors, catalog_vendors, connector_vendors, injector_vendors, vendors
+
+    openaev = {"email-smtp", "mailpit-collector"}
+    for family in (vendors, injector_vendors, catalog_vendors, ai_vendors):
+        openaev |= set(family.SPECS)
+    assert not openaev & set(connector_vendors.SPECS)
+    assert not connector_vendors.BROKEN

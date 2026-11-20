@@ -246,6 +246,9 @@ def install(
         and (common := root.parent / "injector_common").exists()
     ):
         requirements += ["-e", str(common)]
+    # httplib2 (Google API clients) bypasses HTTP(S)_PROXY without PySocks: a test through the
+    # proxy would reach the real vendor
+    requirements.append("pysocks")
     output = _run(["uv", "pip", "install", "--python", str(component.python), *requirements])
     if pyoaev:
         # Test the component against a local pyoaev checkout instead of the pinned release

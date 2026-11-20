@@ -26,6 +26,7 @@ PROXY_PORT = int(os.environ.get("STATICFIRE_PROXY_PORT", "8899"))
 PROXY_ADDON = Path(__file__).with_name("proxy_addon.py")
 PROXY_DIR = STATE_DIR / "mitmproxy"
 TLS_DIR = STATE_DIR / "tls"
+SELF_HEADER = "X-Staticfire-Check"
 
 
 def tls_files() -> tuple[Path, Path]:
@@ -67,7 +68,11 @@ class Ofapi:
         self.cert = cert
         self.base = f"https://127.0.0.1:{port}"
         self.http_base = f"http://127.0.0.1:{http_port}"
-        self.http = httpx.Client(base_url=self.base, verify=str(cert), timeout=10)
+        # Requests a test makes itself (to read a fake's dataset) are marked: the journal
+        # leaves them out, so that it only shows what the component under test called
+        self.http = httpx.Client(
+            base_url=self.base, verify=str(cert), timeout=10, headers={SELF_HEADER: "1"}
+        )
         # Whether ofapi_up started this instance (a recipe then stops it) or reused one
         self.started = False
 
@@ -119,9 +124,11 @@ class Ofapi:
         return self.http.post("/_control/rules", json=body).raise_for_status().json()
 
     def journal(self, path: str = "") -> list[dict]:
+        """What the code under test sent under ``path`` (the test's own reads left out)."""
         response = self.http.get("/_control/journal", params={"path": path} if path else None)
         data = response.raise_for_status().json()
-        return data.get("entries", data) if isinstance(data, dict) else data
+        entries = data.get("entries", data) if isinstance(data, dict) else data
+        return [e for e in entries if SELF_HEADER.lower() not in (e.get("headers") or {})]
 
 
 def ofapi_up(path: str | None = None, port: int = OFAPI_PORT, timeout: float = 60) -> Ofapi:

@@ -37,7 +37,7 @@ ENV = {"SHODAN_TOKEN": "staticfire-fake-key"}
 
 SPECS = [
     ConnectorSpec(
-        recipe="shodan",
+        recipe="shodan-cti",
         connector="internal-enrichment/shodan",
         env=lambda fake: dict(ENV),
         enrich=_new_address,
