@@ -1433,11 +1433,32 @@ def matrix(
     serial = [run for run in runs if run[0] not in connector_vendors.SPECS]
     parallel = [run for run in runs if run[0] in connector_vendors.SPECS]
     rows = [one(*run) for run in serial]
-    # Specs of one connector share its run: they go one after the other
-    by_connector: dict[str, list] = {}
-    for run in parallel:
-        by_connector.setdefault(connector_vendors.SPECS[run[0]].connector, []).append(run)
     with ThreadPoolExecutor(max_workers=max(1, jobs)) as pool:
-        groups = pool.map(lambda group: [one(*run) for run in group], by_connector.values())
+        groups = pool.map(lambda group: [one(*run) for run in group], _exclusive_groups(parallel))
         rows += [row for group in groups for row in group]
     return rows
+
+
+def _exclusive_groups(runs: list[tuple]) -> list[list[tuple]]:
+    """Connector runs that must not overlap, together: specs of one connector share its run,
+    specs calling one vendor fake share its rules and journal (each test resets them)."""
+    parent: dict[str, str] = {}
+
+    def find(key: str) -> str:
+        while parent.setdefault(key, key) != key:
+            key = parent[key]
+        return key
+
+    for name, _ in runs:
+        spec = connector_vendors.SPECS[name]
+        keys = [f"connector:{spec.connector}"]
+        keys += [f"vendor:{_root(c)}" for c in spec.calls if _root(c) not in SHARED_PREFIXES]
+        for key in keys[1:]:
+            parent[find(key)] = find(keys[0])
+        find(keys[0])
+    groups: dict[str, list] = {}
+    for run in runs:
+        groups.setdefault(
+            find(f"connector:{connector_vendors.SPECS[run[0]].connector}"), []
+        ).append(run)
+    return list(groups.values())
