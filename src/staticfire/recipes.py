@@ -649,8 +649,15 @@ def vendor_injector(
         up = _start(report, profile, injector, "injector", env=env, pyoaev=pyoaev)
         if not up:
             return report
-        contract_ids = [c["contract_id"] for c in up["contracts"]]
-        if not report.check(f"contract {spec.contract} registered", spec.contract in contract_ids):
+
+        # The platform may know the injector from an earlier run: contracts it creates at
+        # startup (nuclei's CVE contracts) appear a while after "registered"
+        def contract_listed() -> bool:
+            listed = ops.injector_contracts(profile, up["component"]["id"])
+            return spec.contract in [c["contract_id"] for c in listed] or None
+
+        listed, _ = wait_until(contract_listed, 120, 5)
+        if not report.check(f"contract {spec.contract} registered", listed):
             return report
         assets = [endpoint["asset_id"]] if endpoint else []
         result = ops.run_inject(
