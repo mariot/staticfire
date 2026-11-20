@@ -74,6 +74,12 @@ class ConnectorSpec:
     # Send the connector's HTTP(S) through the proxy (off for clients ignoring proxies, which
     # then need their vendor URL pointed at ofapi in ``env``)
     proxy: bool = True
+    # Seeds OpenCTI before the connector starts (OpenCTI client -> None): objects an import
+    # links to, data an enrichment rule reads...
+    prepare: Callable[[Any], None] | None = None
+    # Checks OpenCTI after the run (OpenCTI client -> [(check name, ok, detail)]): what a
+    # connector writing through the API changed (a label, a date, a score...)
+    verify: Callable[[Any], list[tuple[str, bool, Any]]] | None = None
     # False for a connector writing through the API without opening works: it is then judged
     # on what its account created (a design weakness worth noting in the description)
     opens_work: bool = True

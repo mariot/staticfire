@@ -1037,6 +1037,8 @@ def connector_test(
         }
         # a spec giving None leaves the variable out (a setting the connector refuses)
         env = {name: value for name, value in env.items() if value is not None}
+        if spec.prepare:
+            spec.prepare(cti)
         # Every run starts from a blank state (two specs of one connector share its id)
         cti.reset_state(runner.detect(str(connector_dir), "connector").component_id)
         started = time.time()
@@ -1050,6 +1052,7 @@ def connector_test(
         connector_id = up["component"]["id"]
         if spec.family == "stream":
             _stream_checks(report, cti, fake, spec, timeout)
+            _verify(report, cti, spec)
             return report
         if spec.family == "internal-enrichment" and spec.enrich:
             target = _enrichment_target(cti, spec.enrich)
@@ -1086,6 +1089,7 @@ def connector_test(
         if not spec.opens_work:
             _knowledge_checks(report, cti, spec, user_id, platform_started, bundles_dir, timeout)
             _vendor_call_checks(report, fake, spec)
+            _verify(report, cti, spec)
             return report
         finished, works = wait_until(done, timeout or spec.timeout, 10)
         works = works or _connector_works(cti, connector_id, platform_started)
@@ -1123,6 +1127,7 @@ def connector_test(
                 [f["name"] for f in files][:5],
             )
         _vendor_call_checks(report, fake, spec)
+        _verify(report, cti, spec)
     except Exception as err:
         report.error = f"{type(err).__name__}: {err}"
     finally:
@@ -1189,6 +1194,11 @@ def _sent_types(bundles_dir: Path) -> list[str]:
             if obj.get("type") == "relationship":
                 types.add(f"relationship:{obj.get('relationship_type')}")
     return sorted(filter(None, types))
+
+
+def _verify(report: Report, cti, spec) -> None:
+    for name, ok, detail in spec.verify(cti) if spec.verify else []:
+        report.check(name, ok, detail)
 
 
 def _journal_since(fake, path: str, since: float) -> list[dict]:
@@ -1341,14 +1351,15 @@ def run_recipe(profile: Profile, name: str, **options) -> Report:
     report = fn(profile, **{k: v for k, v in options.items() if k in accepted and v})
     try:
         # Connector recipes may run concurrently: only their own run's component log is theirs
-        # and OpenAEV recipes run beside them: leave the connectors' logs out of their review
+        # and OpenAEV recipes run beside them: leave the connectors' logs out of their review,
+        # and the fakes' (one shared log, never rotated, of every vendor module)
         own = (
             [f"connector-{Path(connector_vendors.SPECS[name].connector).name}"]
             if (platform == "opencti")
             else [
                 d.name
                 for d in (runner.RUNS_DIR.iterdir() if runner.RUNS_DIR.exists() else [])
-                if not d.name.startswith("connector-")
+                if not d.name.startswith(("connector-", "fake-"))
             ]
         )
         logs = logscan.review(log_profile, started_at, skew, platform, runs=own)
