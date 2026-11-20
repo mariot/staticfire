@@ -195,9 +195,14 @@ def component_up(
         return {"component": component.__dict__, "run": existing.summary(), "reused": True}
     run = runner.start(component, profile, env, run_name=run_name, log_level=log_level)
     api = cti_client(profile) if component.kind == "connector" else client(profile)
-    registered, entity = wait_until(
-        lambda: _registered(api, component) if run.alive else "died", timeout, 2
-    )
+
+    def registration():
+        if run.alive:
+            return _registered(api, component)
+        # a run-once connector can register, run and exit between two polls
+        return (component.kind == "connector" and _registered(api, component, True)) or "died"
+
+    registered, entity = wait_until(registration, timeout, 2)
     result: dict[str, Any] = {
         "component": {**component.__dict__, "id": component.component_id},
         "run": run.summary(),
@@ -214,15 +219,18 @@ def component_up(
     return result
 
 
-def _registered(api: OpenAEV | OpenCTI, component: runner.Component) -> dict | None:
+def _registered(
+    api: OpenAEV | OpenCTI, component: runner.Component, exited: bool = False
+) -> dict | None:
     if component.kind == "connector":
         try:
             connector = api.connector(component.component_id)
         except OpenCTIError:
             return None
+        # an exited connector is no longer active, but it registered if the platform knows it
         return (
             connector
-            and connector.get("active")
+            and (connector.get("active") or exited)
             and {
                 "id": connector["id"],
                 "name": connector.get("name"),

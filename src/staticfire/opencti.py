@@ -7,6 +7,7 @@ ingested is read back through the knowledge queries.
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime, timedelta
 
 import httpx
 
@@ -70,15 +71,20 @@ class OpenCTI:
         except OpenCTIError:
             pass  # never registered yet
 
-    def prune_connectors(self, name_prefix: str) -> int:
-        """Delete the inactive connectors named ``name_prefix``...: the platform lists about 500
-        connectors at most and workers only consume the queues of listed ones, so connectors left
-        over by earlier runs push new ones out of ingestion."""
+    def prune_connectors(self, name_prefix: str, idle_s: float = 3600) -> int:
+        """Delete the connectors named ``name_prefix``... inactive for ``idle_s``: the platform
+        lists about 500 connectors at most and workers only consume the queues of listed ones,
+        so connectors left over by earlier runs push new ones out of ingestion. A connector that
+        just exited may still be under test."""
+        cutoff = datetime.now(UTC) - timedelta(seconds=idle_s)
         deleted = 0
         while stale := [
             c
             for c in self.connectors()
-            if c["name"].startswith(name_prefix) and not c["active"] and not c["built_in"]
+            if c["name"].startswith(name_prefix)
+            and not c["active"]
+            and not c["built_in"]
+            and datetime.fromisoformat(c["updated_at"].replace("Z", "+00:00")) < cutoff
         ]:
             for connector in stale:
                 self.graphql(

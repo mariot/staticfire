@@ -1061,6 +1061,14 @@ def connector_test(
         skew = logscan.host_skew(profile)
         report.refs["clock_skew_s"] = round(skew, 1)
         platform_started = started + skew
+        if spec.family == "stream":
+            # Live events only: replaying the platform's history first (a first run's default)
+            # takes longer than a test as the platform fills up
+            start_ms = str(int(platform_started * 1000))
+            env.setdefault("CONNECTOR_LIVE_STREAM_START_TIMESTAMP", start_ms)
+            # recovering up to the start replays nothing (the SDK wants a date, not "false")
+            start_iso = datetime.fromtimestamp(platform_started, UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+            env.setdefault("CONNECTOR_LIVE_STREAM_RECOVER_ISO_DATE", start_iso)
         up = _start(report, profile, str(connector_dir), "connector", kind="connector", env=env)
         if not up:
             return report

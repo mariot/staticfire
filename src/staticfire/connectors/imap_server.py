@@ -16,6 +16,8 @@ from datetime import UTC, datetime
 from email import message_from_bytes
 from email.utils import parseaddr, parsedate_to_datetime
 
+import httpx
+
 from staticfire.fakes import Ofapi, tls_files
 
 _server: dict = {}
@@ -108,7 +110,9 @@ class Session:
         return False
 
     def select(self) -> None:
-        items = self.fake.http.get("/mailbox/messages").raise_for_status().json()["messages"]
+        # Read for the connector, so unmarked: its visit is what the journal must show
+        with httpx.Client(base_url=self.fake.base, verify=str(self.fake.cert), timeout=10) as http:
+            items = http.get("/mailbox/messages").raise_for_status().json()["messages"]
         self.messages = [(item["uid"], item["raw"].encode()) for item in items]
         self.send(f"* {len(self.messages)} EXISTS")
         self.send("* 0 RECENT")
