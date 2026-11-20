@@ -118,6 +118,8 @@ def _connector(root: Path, connector_type: str) -> Component:
         target = m[-1]
         if re.search(r"python3?\s+-m\s+" + re.escape(target), entrypoint.read_text()):
             module = target
+            # "python -m src" runs from the connector root, where src/ is a package
+            workdir = str(root) if module.split(".")[0] == "src" else workdir
         else:
             script = target
     elif dockerfile.exists():
