@@ -36,7 +36,12 @@ SPEC = ConnectorSpec(
     recipe="report-article-fetcher",
     connector="internal-enrichment/report-article-fetcher",
     # the per-report summary is written at error level by default: info keeps the log judgeable
-    env=lambda fake: {"REPORT_ARTICLE_FETCHER_SUMMARY_LOG_LEVEL": "info"},
+    env=lambda fake: {
+        "REPORT_ARTICLE_FETCHER_SUMMARY_LOG_LEVEL": "info",
+        # it refuses hosts that do not resolve to a public address: the lookup is allowed, the
+        # page itself still comes from ofapi through the proxy
+        "STATICFIRE_NETWORK_ALLOW": "www.example.net",
+    },
     enrich=_report,
     expected_types={"report"},
     calls=["/report-article-fetcher/news/"],

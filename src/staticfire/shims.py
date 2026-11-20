@@ -6,6 +6,9 @@ without touching its code.
   the real vendor's certificate would pass.
 * without libmagic on this machine (python-magic cannot load), a ``magic`` module using the
   file(1) command stands in for python-magic.
+* the network stops at the machine: a host other than the platform's, this machine's or one in
+  ``STATICFIRE_NETWORK_ALLOW`` does not resolve, and no connection goes to a public address. A
+  client ignoring the proxy then fails loudly instead of reaching the real vendor.
 * ``rabbitmq`` resolves to ``MQ_HOST``: OpenCTI advertises its RabbitMQ by its Docker name,
   which a connector deployed next to it resolves; one taking the advertised settings over its
   helper's (diode-import) would not reach it from this machine.
@@ -30,16 +33,67 @@ try:
 except ImportError:
     pass
 
+import ipaddress
+from urllib.parse import urlparse
+
 _getaddrinfo = socket.getaddrinfo
+
+
+def _allowed_hosts():
+    hosts = {"localhost", "rabbitmq", os.environ.get("MQ_HOST", "")}
+    for name in ("NO_PROXY", "no_proxy", "STATICFIRE_NETWORK_ALLOW"):
+        hosts |= {h.strip().lower() for h in os.environ.get(name, "").split(",")}
+    for name in ("OPENCTI_URL", "OPENAEV_URL"):
+        hosts.add((urlparse(os.environ.get(name, "")).hostname or "").lower())
+    return {h for h in hosts if h}
+
+
+_ALLOWED = _allowed_hosts()
+
+
+def _local(address):
+    try:
+        ip = ipaddress.ip_address(address.split("%")[0])
+    except ValueError:
+        return False
+    return ip.is_loopback or ip.is_private or ip.is_link_local or address in _ALLOWED
 
 
 def _resolve(host, *args, **kwargs):
     if host == "rabbitmq" and os.environ.get("MQ_HOST"):
         host = os.environ["MQ_HOST"]
+    name = host.decode() if isinstance(host, bytes) else str(host or "")
+    if name and name.lower() not in _ALLOWED and not _local(name):
+        raise socket.gaierror(
+            socket.EAI_NONAME, f"staticfire: {name} is outside the test (use the proxy)"
+        )
     return _getaddrinfo(host, *args, **kwargs)
 
 
+def _guard(original):
+    def guarded(self, address, *args):
+        target = address[0] if isinstance(address, tuple) else None
+        if isinstance(target, str) and not _local(target):
+            raise ConnectionRefusedError(f"staticfire: {target} is outside the test")
+        return original(self, address, *args)
+
+    return guarded
+
+
+def _guard_sendto(original):
+    def guarded(self, data, *args):
+        address = args[-1] if args else None
+        if isinstance(address, tuple) and not _local(str(address[0])):
+            raise ConnectionRefusedError(f"staticfire: {address[0]} is outside the test")
+        return original(self, data, *args)
+
+    return guarded
+
+
 socket.getaddrinfo = _resolve
+socket.socket.connect = _guard(socket.socket.connect)
+socket.socket.connect_ex = _guard(socket.socket.connect_ex)
+socket.socket.sendto = _guard_sendto(socket.socket.sendto)
 """
 
 

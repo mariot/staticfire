@@ -147,17 +147,20 @@ def _connector(root: Path, connector_type: str) -> Component:
                 workdir = str(root / "src") if (root / "src").is_dir() else str(root)
                 break
     if script.startswith("/"):
-        # an absolute path in the image (/opt/<...>/src/main.py): the same file in the checkout
+        # an absolute path in the image (/opt/<...>/main.py): the same file in the checkout, at
+        # its root or under src/ (images often copy src/ to /opt/<name>)
         parts = Path(script).parts[1:]
-        script = next(
+        found = next(
             (
-                str(Path(*parts[i:]))
+                (base, Path(*parts[i:]))
                 for i in range(len(parts))
-                if (root / Path(*parts[i:])).exists()
+                for base in (root, root / "src")
+                if (base / Path(*parts[i:])).exists()
             ),
-            script,
+            None,
         )
-        workdir = str(root)
+        if found:
+            workdir, script = str(found[0]), str(found[1])
     if script and not (Path(workdir) / script).exists() and (root / script).exists():
         workdir = str(root)
     if not (script or module or entry):

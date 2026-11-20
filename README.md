@@ -110,10 +110,25 @@ How a connector test works:
   schema read config.yml, which a test has not), a placeholder for every required setting of its
   config schema, then the spec's.
 - The log review covers the connector's log, OpenCTI's and the workers' (where ingestion errors
-  show).
-- Connectors are independent: `--jobs` runs several at once (ofapi's rules and journal are reset
-  per vendor prefix). A connector that cannot run offline has a spec saying why and reports
-  `SKIP`.
+  show); any ERROR in the connector's own log fails the test (connectors often catch their
+  failures and still complete their work).
+- **AWS is emulated** by moto inside ofapi (`aws.py`, every `*.amazonaws.com` host: S3, STS,
+  EC2...); `fake.s3_put(bucket, key, content, region)` seeds S3.
+- **The network stops at the machine**: a `sitecustomize` (`shims.py`) makes hosts outside the test
+  unresolvable and refuses connections to public addresses, so a client ignoring the proxy fails
+  instead of reaching the real vendor (`STATICFIRE_NETWORK_ALLOW` lets a spec allow one host). It
+  also points certifi at the proxy's CA bundle, resolves `rabbitmq` to the platform, and stands in
+  for python-magic when libmagic is missing.
+- Specs can seed OpenCTI before the run (`prepare`), check it after (`verify`), follow a filtered
+  live stream of their own (`stream_filters`), be judged on what their account created when the
+  connector opens no work (`opens_work=False`), and leave out a setting the recipe sets (`None`).
+- Connectors are independent: `--jobs` runs several at once (the journal checks only count calls
+  made since the test started; each run starts from a reset state). A connector that cannot run
+  offline has a spec saying why and reports `SKIP`.
+
+Coverage: every connector of the repository has a spec (384 specs for 326 connectors, several
+scenarios for some); 3 are SKIP (LibreOffice, AMQP input, OpenDXL). The defects these tests
+exposed are listed under "Known gaps".
 
 Specs live in `src/staticfire/connectors/` (one module per connector), vendor fakes in ofapi's
 `app/vendors/` (one module per vendor, loaded live by `POST /_control/reload`).
