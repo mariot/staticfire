@@ -1053,6 +1053,7 @@ def connector_test(
         env = {name: value for name, value in env.items() if value is not None}
         if spec.prepare:
             spec.prepare(cti)
+        report.refs["pruned_connectors"] = cti.prune_connectors("staticfire ")
         # Every run starts from a blank state (two specs of one connector share its id)
         cti.reset_state(runner.detect(str(connector_dir), "connector").component_id)
         started = time.time()

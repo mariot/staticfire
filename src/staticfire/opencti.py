@@ -70,6 +70,23 @@ class OpenCTI:
         except OpenCTIError:
             pass  # never registered yet
 
+    def prune_connectors(self, name_prefix: str) -> int:
+        """Delete the inactive connectors named ``name_prefix``...: the platform lists about 500
+        connectors at most and workers only consume the queues of listed ones, so connectors left
+        over by earlier runs push new ones out of ingestion."""
+        deleted = 0
+        while stale := [
+            c
+            for c in self.connectors()
+            if c["name"].startswith(name_prefix) and not c["active"] and not c["built_in"]
+        ]:
+            for connector in stale:
+                self.graphql(
+                    "mutation ($id: ID!) { deleteConnector(id: $id) }", {"id": connector["id"]}
+                )
+            deleted += len(stale)
+        return deleted
+
     def changed_since(
         self, since_iso: str, creator_id: str | None = None, first: int = 500
     ) -> list[dict]:
